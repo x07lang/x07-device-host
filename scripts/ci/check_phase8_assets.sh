@@ -8,7 +8,7 @@ import hashlib, json, pathlib, sys
 
 ROOT = pathlib.Path(sys.argv[1])
 ASSETS = ROOT / "crates" / "x07-device-host-assets" / "assets"
-paths = ["index.html", "bootstrap.js"]
+paths = ["index.html", "bootstrap.js", "app-host.mjs"]
 
 def sha256_file(p: pathlib.Path) -> str:
   h = hashlib.sha256()

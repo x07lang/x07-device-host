@@ -1,0 +1,21 @@
+[package]
+name = "x07-device-host-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "x07-device-host-desktop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.4", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+tao = "0.34.5"
+wry = "0.54.1"
+
+x07-device-host-abi = { path = "../x07-device-host-abi" }
+x07-device-host-assets = { path = "../x07-device-host-assets" }
