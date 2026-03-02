@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "crates/x07-device-host-assets",
+  "crates/x07-device-host-abi",
+]
+resolver = "2"
+
