@@ -13,7 +13,7 @@ The [X07 toolchain](https://github.com/x07lang/x07) must be installed before usi
 | Surface | Description |
 |---------|-------------|
 | **Host assets** (`crates/x07-device-host-assets/`) | Pinned host bootstrap assets consumed by device bundles |
-| **Host ABI** (`crates/x07-device-host-abi/`) | Deterministic host ABI hash used by `x07-wasm device` bundles for compatibility verification |
+| **Host ABI** (`crates/x07-device-host-abi/`) | Deterministic host ABI hash used by `x07-wasm device` bundles for compatibility verification (snapshot: `arch/host_abi/host_abi.snapshot.json`) |
 | **Desktop runner** (`crates/x07-device-host-desktop/`) | System WebView runner using `tao`/`wry` (macOS, Linux, Windows) |
 | **iOS template** (`mobile/ios/template/`) | WKWebView project template with embedded host assets (store-safe, no remote code loading) |
 | **Android template** (`mobile/android/template/`) | WebViewAssetLoader project template with embedded host assets (store-safe, no remote code loading) |
@@ -30,7 +30,7 @@ The host enforces a locked-down bridge:
 
 - Only local HTML/JS/wasm assets loaded from the device bundle
 - No navigation to arbitrary URLs
-- CSP restricts scripts to `self` (no remote scripts)
+- CSP restricts scripts to `self` and WebAssembly compilation via `'wasm-unsafe-eval'` (no `'unsafe-eval'`)
 - All HTTP calls go through `x07.device.http.fetch` with allowlisted hostnames, timeouts, and budgets
 - Single structured message channel with schema-versioned envelopes
 
