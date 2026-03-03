@@ -31,8 +31,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
-      - name: cargo clippy --all-targets -- -D warnings
-        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (core crates)
+        run: cargo clippy -p x07-device-host-assets -p x07-device-host-abi --all-targets -- -D warnings
 
   test:
     name: ci / test
@@ -47,3 +47,17 @@ jobs:
       - name: Phase 8
         run: bash scripts/ci/check_phase8.sh
 
+  phase9_macos:
+    name: ci / phase9 (macos)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Phase 9
+        run: bash scripts/ci/check_phase9.sh
+      - name: cargo clippy (desktop)
+        run: cargo clippy -p x07-device-host-desktop --all-targets -- -D warnings
