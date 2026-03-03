@@ -46,6 +46,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Phase 8
         run: bash scripts/ci/check_phase8.sh
+      - name: Phase 10
+        run: bash scripts/ci/check_phase10.sh
 
   phase9_macos:
     name: ci / phase9 (macos)
@@ -59,5 +61,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Phase 9
         run: bash scripts/ci/check_phase9.sh
+      - name: Phase 10
+        run: bash scripts/ci/check_phase10.sh
       - name: cargo clippy (desktop)
         run: cargo clippy -p x07-device-host-desktop --all-targets -- -D warnings

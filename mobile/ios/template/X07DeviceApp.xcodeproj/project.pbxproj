@@ -1,0 +1,250 @@
+// !$*UTF8*$!
+{
+  archiveVersion = 1;
+  classes = {
+  };
+  objectVersion = 56;
+  objects = {
+
+/* Begin PBXBuildFile section */
+    111111111111111111111111 /* X07DeviceAppApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222222222222222222222222 /* X07DeviceAppApp.swift */; };
+    111111111111111111111112 /* X07WebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222222222222222222222223 /* X07WebView.swift */; };
+    111111111111111111111113 /* X07SchemeHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222222222222222222222224 /* X07SchemeHandler.swift */; };
+    111111111111111111111114 /* x07 in Resources */ = {isa = PBXBuildFile; fileRef = 222222222222222222222225 /* x07 */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+    222222222222222222222220 /* X07DeviceApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = X07DeviceApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+    222222222222222222222221 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+    222222222222222222222222 /* X07DeviceAppApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = X07DeviceAppApp.swift; sourceTree = "<group>"; };
+    222222222222222222222223 /* X07WebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = X07WebView.swift; sourceTree = "<group>"; };
+    222222222222222222222224 /* X07SchemeHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = X07SchemeHandler.swift; sourceTree = "<group>"; };
+    222222222222222222222225 /* x07 */ = {isa = PBXFileReference; lastKnownFileType = folder; path = x07; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+    333333333333333333333333 /* Frameworks */ = {
+      isa = PBXFrameworksBuildPhase;
+      buildActionMask = 2147483647;
+      files = (
+      );
+      runOnlyForDeploymentPostprocessing = 0;
+    };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+    444444444444444444444444 = {
+      isa = PBXGroup;
+      children = (
+        444444444444444444444445 /* X07DeviceApp */,
+        444444444444444444444446 /* Products */,
+      );
+      sourceTree = "<group>";
+    };
+    444444444444444444444445 /* X07DeviceApp */ = {
+      isa = PBXGroup;
+      children = (
+        222222222222222222222221 /* Info.plist */,
+        222222222222222222222222 /* X07DeviceAppApp.swift */,
+        222222222222222222222223 /* X07WebView.swift */,
+        222222222222222222222224 /* X07SchemeHandler.swift */,
+        222222222222222222222225 /* x07 */,
+      );
+      path = X07DeviceApp;
+      sourceTree = "<group>";
+    };
+    444444444444444444444446 /* Products */ = {
+      isa = PBXGroup;
+      children = (
+        222222222222222222222220 /* X07DeviceApp.app */,
+      );
+      name = Products;
+      sourceTree = "<group>";
+    };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+    555555555555555555555555 /* X07DeviceApp */ = {
+      isa = PBXNativeTarget;
+      buildConfigurationList = 666666666666666666666666 /* Build configuration list for PBXNativeTarget "X07DeviceApp" */;
+      buildPhases = (
+        777777777777777777777777 /* Sources */,
+        777777777777777777777778 /* Frameworks */,
+        777777777777777777777779 /* Resources */,
+      );
+      buildRules = (
+      );
+      dependencies = (
+      );
+      name = X07DeviceApp;
+      productName = X07DeviceApp;
+      productReference = 222222222222222222222220 /* X07DeviceApp.app */;
+      productType = "com.apple.product-type.application";
+    };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+    888888888888888888888888 /* Project object */ = {
+      isa = PBXProject;
+      attributes = {
+        BuildIndependentTargetsInParallel = 1;
+        LastSwiftUpdateCheck = 1500;
+        LastUpgradeCheck = 1500;
+        TargetAttributes = {
+          555555555555555555555555 = {
+            CreatedOnToolsVersion = 15.0;
+          };
+        };
+      };
+      buildConfigurationList = 666666666666666666666667 /* Build configuration list for PBXProject "X07DeviceApp" */;
+      compatibilityVersion = "Xcode 14.0";
+      developmentRegion = en;
+      hasScannedForEncodings = 0;
+      knownRegions = (
+        en,
+        Base,
+      );
+      mainGroup = 444444444444444444444444;
+      productRefGroup = 444444444444444444444446 /* Products */;
+      projectDirPath = "";
+      projectRoot = "";
+      targets = (
+        555555555555555555555555 /* X07DeviceApp */,
+      );
+    };
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+    777777777777777777777779 /* Resources */ = {
+      isa = PBXResourcesBuildPhase;
+      buildActionMask = 2147483647;
+      files = (
+        111111111111111111111114 /* x07 in Resources */,
+      );
+      runOnlyForDeploymentPostprocessing = 0;
+    };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+    777777777777777777777777 /* Sources */ = {
+      isa = PBXSourcesBuildPhase;
+      buildActionMask = 2147483647;
+      files = (
+        111111111111111111111111 /* X07DeviceAppApp.swift in Sources */,
+        111111111111111111111112 /* X07WebView.swift in Sources */,
+        111111111111111111111113 /* X07SchemeHandler.swift in Sources */,
+      );
+      runOnlyForDeploymentPostprocessing = 0;
+    };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+    999999999999999999999991 /* Debug */ = {
+      isa = XCBuildConfiguration;
+      buildSettings = {
+        ALWAYS_SEARCH_USER_PATHS = NO;
+        CLANG_ANALYZER_NONNULL = YES;
+        CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+        CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+        CLANG_ENABLE_MODULES = YES;
+        CLANG_ENABLE_OBJC_ARC = YES;
+        CLANG_ENABLE_OBJC_WEAK = YES;
+        CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+        CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+        CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+        CLANG_WARN_UNREACHABLE_CODE = YES;
+        CODE_SIGN_STYLE = Automatic;
+        COPY_PHASE_STRIP = NO;
+        DEBUG_INFORMATION_FORMAT = dwarf;
+        ENABLE_TESTABILITY = YES;
+        GCC_C_LANGUAGE_STANDARD = gnu11;
+        INFOPLIST_FILE = X07DeviceApp/Info.plist;
+        IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+        LD_RUNPATH_SEARCH_PATHS = (
+          "$(inherited)",
+          "@executable_path/Frameworks",
+        );
+        MARKETING_VERSION = __X07_VERSION__;
+        CURRENT_PROJECT_VERSION = __X07_BUILD__;
+        PRODUCT_BUNDLE_IDENTIFIER = __X07_IOS_BUNDLE_ID__;
+        PRODUCT_NAME = "$(TARGET_NAME)";
+        SWIFT_VERSION = 5.0;
+        TARGETED_DEVICE_FAMILY = "1,2";
+      };
+      name = Debug;
+    };
+    999999999999999999999992 /* Release */ = {
+      isa = XCBuildConfiguration;
+      buildSettings = {
+        ALWAYS_SEARCH_USER_PATHS = NO;
+        CLANG_ANALYZER_NONNULL = YES;
+        CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+        CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+        CLANG_ENABLE_MODULES = YES;
+        CLANG_ENABLE_OBJC_ARC = YES;
+        CLANG_ENABLE_OBJC_WEAK = YES;
+        CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+        CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+        CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+        CLANG_WARN_UNREACHABLE_CODE = YES;
+        CODE_SIGN_STYLE = Automatic;
+        COPY_PHASE_STRIP = YES;
+        DEBUG_INFORMATION_FORMAT = dwarf;
+        GCC_C_LANGUAGE_STANDARD = gnu11;
+        INFOPLIST_FILE = X07DeviceApp/Info.plist;
+        IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+        LD_RUNPATH_SEARCH_PATHS = (
+          "$(inherited)",
+          "@executable_path/Frameworks",
+        );
+        MARKETING_VERSION = __X07_VERSION__;
+        CURRENT_PROJECT_VERSION = __X07_BUILD__;
+        PRODUCT_BUNDLE_IDENTIFIER = __X07_IOS_BUNDLE_ID__;
+        PRODUCT_NAME = "$(TARGET_NAME)";
+        SWIFT_VERSION = 5.0;
+        TARGETED_DEVICE_FAMILY = "1,2";
+      };
+      name = Release;
+    };
+    999999999999999999999993 /* Debug */ = {
+      isa = XCBuildConfiguration;
+      buildSettings = {
+        CODE_SIGN_STYLE = Automatic;
+        PRODUCT_NAME = "$(TARGET_NAME)";
+      };
+      name = Debug;
+    };
+    999999999999999999999994 /* Release */ = {
+      isa = XCBuildConfiguration;
+      buildSettings = {
+        CODE_SIGN_STYLE = Automatic;
+        PRODUCT_NAME = "$(TARGET_NAME)";
+      };
+      name = Release;
+    };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+    666666666666666666666666 /* Build configuration list for PBXNativeTarget "X07DeviceApp" */ = {
+      isa = XCConfigurationList;
+      buildConfigurations = (
+        999999999999999999999991 /* Debug */,
+        999999999999999999999992 /* Release */,
+      );
+      defaultConfigurationIsVisible = 0;
+      defaultConfigurationName = Release;
+    };
+    666666666666666666666667 /* Build configuration list for PBXProject "X07DeviceApp" */ = {
+      isa = XCConfigurationList;
+      buildConfigurations = (
+        999999999999999999999993 /* Debug */,
+        999999999999999999999994 /* Release */,
+      );
+      defaultConfigurationIsVisible = 0;
+      defaultConfigurationName = Release;
+    };
+/* End XCConfigurationList section */
+  };
+  rootObject = 888888888888888888888888 /* Project object */;
+}
+

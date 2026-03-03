@@ -11,6 +11,11 @@ Phase 9 adds:
 
 - `x07-device-host-desktop`: desktop system-WebView runner (`tao`/`wry`)
 
+Phase 10 adds:
+
+- `mobile/ios/template`: iOS project template (WKWebView) with embedded host assets
+- `mobile/android/template`: Android project template (WebViewAssetLoader) with embedded host assets
+
 ## Desktop runner
 
 Build:

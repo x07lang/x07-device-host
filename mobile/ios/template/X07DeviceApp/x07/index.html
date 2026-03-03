@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; connect-src 'self' https: http:; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>x07 device</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+      #app {
+        padding: 16px;
+      }
+      pre {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./bootstrap.js"></script>
+  </body>
+</html>
