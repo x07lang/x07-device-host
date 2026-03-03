@@ -551,11 +551,10 @@ fn navigation_allowed(url: &str) -> bool {
         return false;
     };
 
-    match (uri.scheme_str(), uri.host()) {
-        (Some("x07"), _) => true,
-        (Some("http" | "https"), Some("x07.localhost")) => true,
-        _ => false,
-    }
+    matches!(
+        (uri.scheme_str(), uri.host()),
+        (Some("x07"), _) | (Some("http" | "https"), Some("x07.localhost"))
+    )
 }
 
 fn handle_custom_protocol(
@@ -717,6 +716,7 @@ fn btreemap1(k: &str, v: Value) -> BTreeMap<String, Value> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_and_exit(
     raw_argv: &[OsString],
     started: Instant,
