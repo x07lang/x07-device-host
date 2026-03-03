@@ -44,7 +44,7 @@ token_targets = [
     ),
 ]
 
-asset_names = ["index.html", "bootstrap.js", "app-host.mjs"]
+asset_names = ["index.html", "bootstrap.js", "main.mjs", "app-host.mjs"]
 
 def sha256(p: pathlib.Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()

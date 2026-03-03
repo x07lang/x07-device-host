@@ -1,6 +1,7 @@
 pub static ASSETS: &[(&str, &[u8])] = &[
     ("index.html", include_bytes!("../assets/index.html")),
     ("bootstrap.js", include_bytes!("../assets/bootstrap.js")),
+    ("main.mjs", include_bytes!("../assets/main.mjs")),
     ("app-host.mjs", include_bytes!("../assets/app-host.mjs")),
 ];
 

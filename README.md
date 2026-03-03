@@ -30,7 +30,7 @@ The host enforces a locked-down bridge:
 
 - Only local HTML/JS/wasm assets loaded from the device bundle
 - No navigation to arbitrary URLs
-- CSP forbids remote scripts and `eval`
+- CSP restricts scripts to `self` (no remote scripts)
 - All HTTP calls go through `x07.device.http.fetch` with allowlisted hostnames, timeouts, and budgets
 - Single structured message channel with schema-versioned envelopes
 

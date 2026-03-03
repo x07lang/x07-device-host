@@ -357,6 +357,13 @@ function sanitizeAttrs(tag, attrs) {
   return out;
 }
 
+export const __x07_host_private = {
+  sanitizeTag,
+  sanitizeSameOriginUrlPath,
+  sanitizeAttr,
+  sanitizeAttrs,
+};
+
 function setAttrs(el, tag, attrs) {
   const next = sanitizeAttrs(tag, attrs);
   const prevNames = new Set();
