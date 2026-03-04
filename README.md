@@ -12,7 +12,7 @@ The [X07 toolchain](https://github.com/x07lang/x07) must be installed before usi
 
 | Surface | Description |
 |---------|-------------|
-| **Host assets** (`crates/x07-device-host-assets/`) | Pinned host bootstrap assets consumed by device bundles |
+| **Host assets** (`crates/x07-device-host-assets/`) | Pinned host bootstrap assets consumed by device bundles (kept in sync with the canonical web host snapshot: `vendor/x07-web-ui/host/host.snapshot.json`) |
 | **Host ABI** (`crates/x07-device-host-abi/`) | Deterministic host ABI hash used by `x07-wasm device` bundles for compatibility verification (snapshot: `arch/host_abi/host_abi.snapshot.json`) |
 | **Desktop runner** (`crates/x07-device-host-desktop/`) | System WebView runner using `tao`/`wry` (macOS, Linux, Windows) |
 | **iOS template** (`mobile/ios/template/`) | WKWebView project template with embedded host assets (store-safe, no remote code loading) |

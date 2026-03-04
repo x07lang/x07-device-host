@@ -1,0 +1,29 @@
+{
+  "schema_version": "x07.web_ui.host.snapshot@0.1.0",
+  "abi_name": "webview_host_v1",
+  "abi_version": "0.1.0",
+  "bridge_protocol_version": "web_ui_bridge_v1",
+  "host_abi_hash": "253d1b935a89b664edb2e9eeabe6b498930fe86c655cd5279e806767387de7ea",
+  "assets": [
+    {
+      "path": "index.html",
+      "sha256": "32dd8528fcd0a92d51031119e7f4b13de9b0b6120eb6dc79aa294d3a39fb7e5a",
+      "bytes_len": 894
+    },
+    {
+      "path": "bootstrap.js",
+      "sha256": "f413cfc31725030c843d3e1a347d281c83c872a90e10b996b6c64db5143a89c6",
+      "bytes_len": 2327
+    },
+    {
+      "path": "main.mjs",
+      "sha256": "254f54e73c2c3afea1b7b29aabded8fcd64fbe5f4f9f7fc07757b0d62a1272f0",
+      "bytes_len": 100
+    },
+    {
+      "path": "app-host.mjs",
+      "sha256": "0197f76d10e631df2048ecf5d034970ca2a980cd2794eebf6f6cf49b4321a2da",
+      "bytes_len": 36377
+    }
+  ]
+}
