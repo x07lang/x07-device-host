@@ -29,7 +29,8 @@ All platforms use the **same approach**: x07 web UI WASM reducer + canonical hos
 The host enforces a locked-down bridge:
 
 - Only local HTML/JS/wasm assets loaded from the device bundle
-- No navigation to arbitrary URLs
+- No navigation to arbitrary URLs (iOS cancels non-`x07:`; Android allowlists `https://appassets.androidplatform.net` + `x07:` only)
+- Android template disables file/content URL access (`allowFileAccess=false`, `allowContentAccess=false`)
 - CSP restricts scripts to `self` and WebAssembly compilation via `'wasm-unsafe-eval'` (no `'unsafe-eval'`)
 - All HTTP calls go through `x07.device.http.fetch` with allowlisted hostnames, timeouts, and budgets
 - Single structured message channel with schema-versioned envelopes

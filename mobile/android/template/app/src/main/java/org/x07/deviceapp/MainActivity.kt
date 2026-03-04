@@ -66,6 +66,10 @@ class MainActivity : AppCompatActivity() {
 
     webView.settings.javaScriptEnabled = true
     webView.settings.domStorageEnabled = true
+    webView.settings.allowFileAccess = false
+    webView.settings.allowContentAccess = false
+    webView.settings.allowFileAccessFromFileURLs = false
+    webView.settings.allowUniversalAccessFromFileURLs = false
     webView.addJavascriptInterface(X07IpcBridge(), "ipc")
 
     val assetLoader = WebViewAssetLoader.Builder()
@@ -73,6 +77,23 @@ class MainActivity : AppCompatActivity() {
       .build()
 
     webView.webViewClient = object : WebViewClient() {
+      private fun allowlistNavigation(request: WebResourceRequest): Boolean {
+        val url = request.url
+        val scheme = url.scheme ?: return false
+        if (scheme == "x07") return true
+        if (scheme == "about" && url.toString() == "about:blank") return true
+        return scheme == "https" && url.host == "appassets.androidplatform.net"
+      }
+
+      override fun shouldOverrideUrlLoading(
+        view: WebView,
+        request: WebResourceRequest,
+      ): Boolean {
+        if (allowlistNavigation(request)) return false
+        Log.w("x07", "blocked navigation: ${request.url}")
+        return true
+      }
+
       override fun shouldInterceptRequest(
         view: WebView,
         request: WebResourceRequest,
@@ -84,4 +105,3 @@ class MainActivity : AppCompatActivity() {
     webView.loadUrl("https://appassets.androidplatform.net/assets/x07/index.html")
   }
 }
-

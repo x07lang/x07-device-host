@@ -73,6 +73,36 @@ for platform, dir_path, tokens in token_targets:
             print(f"missing token {tok} under {dir_path}", file=sys.stderr)
             sys.exit(1)
 
+main_activity = (
+    root
+    / "mobile"
+    / "android"
+    / "template"
+    / "app"
+    / "src"
+    / "main"
+    / "java"
+    / "org"
+    / "x07"
+    / "deviceapp"
+    / "MainActivity.kt"
+)
+main_activity_src = main_activity.read_text(encoding="utf-8")
+required_android_hardening = [
+    "allowFileAccess = false",
+    "allowContentAccess = false",
+    "allowFileAccessFromFileURLs = false",
+    "allowUniversalAccessFromFileURLs = false",
+    "shouldOverrideUrlLoading",
+    'scheme == "x07"',
+    "appassets.androidplatform.net",
+]
+for needle in required_android_hardening:
+    if needle not in main_activity_src:
+        print(f"android template MainActivity missing: {needle}", file=sys.stderr)
+        print(main_activity, file=sys.stderr)
+        sys.exit(1)
+
 for platform, dst_root in targets:
     for name in asset_names:
         src = canonical_assets / name
