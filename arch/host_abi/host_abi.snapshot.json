@@ -17,12 +17,12 @@
       },
       {
         "path": "app-host.mjs",
-        "sha256": "0197f76d10e631df2048ecf5d034970ca2a980cd2794eebf6f6cf49b4321a2da"
+        "sha256": "c34ce30e274c7ae075844129264500f696781b58c8f58490d722227115734a9b"
       }
     ],
     "bridge_protocol_version": "web_ui_bridge_v1"
   },
-  "host_abi_hash": "253d1b935a89b664edb2e9eeabe6b498930fe86c655cd5279e806767387de7ea",
+  "host_abi_hash": "2fb44db0c1c2c10f2146d3d81cd852588acf0669a10d07d42eeef26e77568ce9",
   "kind": "device_host_abi_snapshot",
   "schema_version": "x07.device.host_abi.snapshot@0.1.0"
 }

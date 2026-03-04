@@ -611,9 +611,18 @@ function streamPayloadToBytes(payload) {
   throw new Error("stream_payload missing base64/text for non-empty body");
 }
 
+function isJsonStringSafeBytes(u8) {
+  for (let i = 0; i < u8.length; i++) {
+    const b = u8[i];
+    if (b < 0x20 || b === 0x22 || b === 0x5c) return false;
+  }
+  return true;
+}
+
 function bytesToStreamPayload(bytes) {
   const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
   const payload = { bytes_len: u8.length, base64: bytesToBase64(u8) };
+  if (!isJsonStringSafeBytes(u8)) return payload;
   try {
     const txt = textDecoderStrict.decode(u8);
     payload.text = txt;
