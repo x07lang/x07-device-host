@@ -3,9 +3,11 @@ name = "x07-device-host-assets"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+description = "Pinned host assets for X07 device hosts."
+repository = "https://github.com/x07lang/x07-device-host"
+readme = "../../README.md"
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-

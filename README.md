@@ -40,7 +40,14 @@ The host enforces a locked-down bridge:
 Build:
 
 ```bash
-cargo build -p x07-device-host-desktop
+x07up component add device-host
+x07-device-host-desktop --version
+```
+
+Fallback:
+
+```bash
+cargo install --locked x07-device-host-desktop --version 0.1.0
 ```
 
 Print the current host ABI hash:
@@ -68,6 +75,9 @@ Generated projects embed the device bundle under `x07/` — no remote code loadi
 
 ## Links
 
+- Recommended install flow:
+  - `x07up component add device-host`
+  - `x07-device-host-desktop --version`
 - [X07 Agent Quickstart](https://x07lang.org/docs/getting-started/agent-quickstart) — start here
 - [X07 toolchain](https://github.com/x07lang/x07)
 - [X07 website](https://x07lang.org)
