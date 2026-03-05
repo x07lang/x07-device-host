@@ -88,7 +88,9 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xz-utils
+          sudo apt-get install -y --no-install-recommends \
+            xz-utils \
+            libwebkit2gtk-4.1-dev
       - name: Build desktop host archive
         id: pack
         env:
