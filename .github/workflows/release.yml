@@ -45,7 +45,7 @@ jobs:
       - name: Run release gate
         shell: bash
         run: |
-          bash scripts/ci/check_phase10.sh
+          bash scripts/ci/check_release_ready.sh
 
   build_desktop_matrix:
     name: desktop-${{ matrix.target }}
@@ -281,6 +281,10 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         shell: bash
         run: |
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is not configured; skipping crates.io publish in GitHub Actions."
+            exit 0
+          fi
           cargo publish --locked -p x07-device-host-assets
           cargo publish --locked -p x07-device-host-abi
           cargo publish --locked -p x07-device-host-desktop
