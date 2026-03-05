@@ -104,6 +104,7 @@ jobs:
           echo "asset_path=${ASSET_PATH}" >> "$GITHUB_OUTPUT"
           echo "asset_name=$(basename "${ASSET_PATH}")" >> "$GITHUB_OUTPUT"
       - name: Attest built archive
+        continue-on-error: true
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: ${{ steps.pack.outputs.asset_path }}
@@ -138,6 +139,7 @@ jobs:
           echo "asset_path=${ASSET_PATH}" >> "$GITHUB_OUTPUT"
           echo "asset_name=$(basename "${ASSET_PATH}")" >> "$GITHUB_OUTPUT"
       - name: Attest mobile templates bundle
+        continue-on-error: true
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: ${{ steps.pack.outputs.asset_path }}
@@ -172,6 +174,7 @@ jobs:
           echo "asset_path=${ASSET_PATH}" >> "$GITHUB_OUTPUT"
           echo "asset_name=$(basename "${ASSET_PATH}")" >> "$GITHUB_OUTPUT"
       - name: Attest ABI snapshot
+        continue-on-error: true
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: ${{ steps.pack.outputs.asset_path }}
@@ -264,6 +267,7 @@ jobs:
             --require assets \
             --require compatibility
       - name: Attest manifest assets
+        continue-on-error: true
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: |
