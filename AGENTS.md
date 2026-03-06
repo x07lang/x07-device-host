@@ -10,7 +10,7 @@
 
 - Release tags are `vX.Y.Z` and must match every published crate version in `crates/`.
 - `scripts/ci/check_release_ready.sh` is the canonical release gate entry point. Keep the phase checks behind that wrapper.
-- Keep `releases/compat/X.Y.Z.json` aligned with the shipped host ABI and assets.
+- Keep `releases/compat/X.Y.Z.json` aligned with the shipped host ABI and assets. For the current compatibility line, use `x07_core: ">=0.1.58,<0.2.0"` instead of patch-only ranges so patch toolchain releases keep working without republishing the same host bits.
 - The release workflow reuses shared helpers from `x07/scripts/release/` through `.release-tools`; do not duplicate archive/checksum/manifest logic locally.
 - Linux desktop release jobs depend on `libwebkit2gtk-4.1-dev`. Keep that package install in the workflow unless the Linux UI stack changes away from `wry`.
 - GitHub Actions may not have `CARGO_REGISTRY_TOKEN`; in that case, publish the crates locally and verify them on crates.io before treating the GitHub release as complete.

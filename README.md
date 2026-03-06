@@ -47,7 +47,13 @@ x07-device-host-desktop --version
 Fallback:
 
 ```bash
-cargo install --locked x07-device-host-desktop --version 0.1.0
+cargo install --locked x07-device-host-desktop --version 0.1.1
+```
+
+Use the git install path only when you need unreleased development state from this repo:
+
+```bash
+cargo install --locked --git https://github.com/x07lang/x07-device-host.git x07-device-host-desktop
 ```
 
 Print the current host ABI hash:
