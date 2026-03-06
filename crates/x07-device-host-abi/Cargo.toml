@@ -1,6 +1,6 @@
 [package]
 name = "x07-device-host-abi"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Pinned ABI snapshot for X07 device hosts."
@@ -15,4 +15,4 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.8"
 
-x07-device-host-assets = { path = "../x07-device-host-assets", version = "0.1.1" }
+x07-device-host-assets = { path = "../x07-device-host-assets", version = "0.1.2" }
