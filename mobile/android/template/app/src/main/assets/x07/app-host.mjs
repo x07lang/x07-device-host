@@ -409,6 +409,14 @@ function setStyle(el, style) {
   }
 }
 
+function sameNodeSequence(prevNodes, nextNodes) {
+  if (prevNodes.length !== nextNodes.length) return false;
+  for (let i = 0; i < prevNodes.length; i++) {
+    if (prevNodes[i] !== nextNodes[i]) return false;
+  }
+  return true;
+}
+
 function reconcileNode(prevNode, prevDom, nextNode) {
   if (!nextNode || typeof nextNode !== "object") {
     return document.createTextNode("");
@@ -468,7 +476,9 @@ function reconcileNode(prevNode, prevDom, nextNode) {
     const childDom = reconcileNode(prev ? prev.node : null, prev ? prev.dom : null, cn);
     newDomChildren.push(childDom);
   }
-  el.replaceChildren(...newDomChildren);
+  if (!sameNodeSequence(prevDomChildren, newDomChildren)) {
+    el.replaceChildren(...newDomChildren);
+  }
 
   return el;
 }
@@ -559,7 +569,10 @@ function render(root, prevTree, nextTree) {
   const nextNode = nextTree.root;
   const prevDom = root.firstChild;
   const nextDom = reconcileNode(prevNode, prevDom, nextNode);
-  root.replaceChildren(nextDom);
+  const prevRootChildren = Array.from(root.childNodes);
+  if (!sameNodeSequence(prevRootChildren, [nextDom])) {
+    root.replaceChildren(nextDom);
+  }
   restoreFocusedControl(root, focusSnapshot);
 }
 

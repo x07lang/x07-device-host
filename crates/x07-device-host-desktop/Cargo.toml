@@ -1,6 +1,6 @@
 [package]
 name = "x07-device-host-desktop"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Desktop system-WebView host for X07 device bundles."
@@ -20,5 +20,5 @@ sha2 = "0.10.8"
 tao = "0.34.5"
 wry = "0.54.1"
 
-x07-device-host-abi = { path = "../x07-device-host-abi", version = "0.1.3" }
-x07-device-host-assets = { path = "../x07-device-host-assets", version = "0.1.3" }
+x07-device-host-abi = { path = "../x07-device-host-abi", version = "0.1.4" }
+x07-device-host-assets = { path = "../x07-device-host-assets", version = "0.1.4" }
