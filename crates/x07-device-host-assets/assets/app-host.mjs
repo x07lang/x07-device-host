@@ -362,6 +362,10 @@ export const __x07_host_private = {
   sanitizeSameOriginUrlPath,
   sanitizeAttr,
   sanitizeAttrs,
+  reconcileNode,
+  render,
+  snapshotFocusedControl,
+  restoreFocusedControl,
 };
 
 function setAttrs(el, tag, attrs) {
@@ -469,16 +473,94 @@ function reconcileNode(prevNode, prevDom, nextNode) {
   return el;
 }
 
+function supportsTextSelection(el) {
+  if (!el || el.nodeType !== 1) return false;
+  const tag = String(el.tagName || "").toLowerCase();
+  return tag === "input" || tag === "textarea";
+}
+
+function snapshotFocusedControl(root) {
+  const active = globalThis.document?.activeElement;
+  if (!active || active.nodeType !== 1) return null;
+  if (typeof root?.contains === "function" && !root.contains(active)) return null;
+
+  const keyed =
+    active?.dataset?.x07Key && typeof active.dataset.x07Key === "string"
+      ? active
+      : active?.closest?.("[data-x07-key]") ?? null;
+  const key = keyed?.dataset?.x07Key || "";
+  if (!key) return null;
+
+  const snap = { key };
+  if (!supportsTextSelection(keyed)) {
+    return snap;
+  }
+
+  const start = keyed.selectionStart;
+  const end = keyed.selectionEnd;
+  const direction = keyed.selectionDirection;
+  if (Number.isInteger(start) && Number.isInteger(end)) {
+    snap.selectionStart = start;
+    snap.selectionEnd = end;
+    if (typeof direction === "string" && direction) {
+      snap.selectionDirection = direction;
+    }
+  }
+  return snap;
+}
+
+function findKeyedElement(root, key) {
+  if (!root || !key) return null;
+  if (root.nodeType === 1 && root?.dataset?.x07Key === key) {
+    return root;
+  }
+  const children = Array.isArray(root?.childNodes) ? root.childNodes : Array.from(root?.childNodes || []);
+  for (const child of children) {
+    const found = findKeyedElement(child, key);
+    if (found) return found;
+  }
+  return null;
+}
+
+function restoreFocusedControl(root, snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return;
+  const key = typeof snapshot.key === "string" ? snapshot.key : "";
+  if (!key) return;
+
+  const target = findKeyedElement(root, key);
+  if (!target || typeof target.focus !== "function") return;
+
+  try {
+    target.focus({ preventScroll: true });
+  } catch (_) {
+    target.focus();
+  }
+
+  if (!supportsTextSelection(target) || typeof target.setSelectionRange !== "function") {
+    return;
+  }
+
+  const start = snapshot.selectionStart;
+  const end = snapshot.selectionEnd;
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return;
+
+  try {
+    target.setSelectionRange(start, end, snapshot.selectionDirection || "none");
+  } catch (_) {}
+}
+
 function render(root, prevTree, nextTree) {
   if (!nextTree || typeof nextTree !== "object") {
     root.textContent = "";
     return;
   }
+  const focusSnapshot = snapshotFocusedControl(root);
   const prevNode = prevTree && typeof prevTree === "object" ? prevTree.root : null;
   const nextNode = nextTree.root;
   const prevDom = root.firstChild;
   const nextDom = reconcileNode(prevNode, prevDom, nextNode);
   root.replaceChildren(nextDom);
+  restoreFocusedControl(root, focusSnapshot);
 }
 
 function downloadJson(filename, doc) {
