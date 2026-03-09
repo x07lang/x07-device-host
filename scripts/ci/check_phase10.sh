@@ -117,5 +117,11 @@ for platform, dst_root in targets:
             )
             sys.exit(1)
 
+bootstrap_src = (canonical_assets / "bootstrap.js").read_text(encoding="utf-8")
+for needle in ["bundle.manifest.json", "loadBundleSidecar(", "capabilities"]:
+    if needle not in bootstrap_src:
+        print(f"canonical bootstrap.js missing bundle-sidecar fallback marker: {needle}", file=sys.stderr)
+        sys.exit(1)
+
 print("ok: phase10 templates")
 PY

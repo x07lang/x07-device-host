@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ const RUN_REPORT_SCHEMA_VERSION: &str = "x07.wasm.device.run.report@0.1.0";
 const RUN_REPORT_COMMAND: &str = "x07-wasm.device.run";
 const EXPECTED_BUNDLE_SCHEMA_VERSION: &str = "x07.device.bundle.manifest@0.1.0";
 const EXPECTED_UI_WASM_PATH: &str = "ui/reducer.wasm";
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "x07-device-host-desktop")]
@@ -58,8 +59,14 @@ struct RunArgs {
 #[derive(Debug, Clone, Deserialize)]
 struct BundleManifestDoc {
     schema_version: String,
+    #[serde(default)]
+    profile: Option<BundleProfileRef>,
+    #[serde(default)]
+    capabilities: Option<BundleManifestFile>,
+    #[serde(default)]
+    telemetry_profile: Option<BundleManifestFile>,
     host: BundleHostDoc,
-    ui_wasm: BundleUiWasmDoc,
+    ui_wasm: BundleManifestFile,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,8 +75,18 @@ struct BundleHostDoc {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct BundleUiWasmDoc {
+#[allow(dead_code)]
+struct BundleProfileRef {
+    id: String,
+    v: u64,
+    file: BundleManifestFile,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BundleManifestFile {
     path: String,
+    sha256: String,
+    bytes_len: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +158,13 @@ struct RunReport {
 
 #[derive(Debug)]
 struct HostState {
-    reducer_wasm: Vec<u8>,
+    bundle_files: BTreeMap<String, ServedFile>,
+}
+
+#[derive(Debug, Clone)]
+struct ServedFile {
+    content_type: &'static str,
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -360,20 +383,26 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         );
     }
 
-    let reducer_wasm_path = bundle_dir.join(&manifest.ui_wasm.path);
-    let reducer_wasm = match std::fs::read(&reducer_wasm_path) {
+    let mut bundle_files = BTreeMap::new();
+    bundle_files.insert(
+        format!("/{BUNDLE_MANIFEST_FILE}"),
+        ServedFile {
+            content_type: JSON_CONTENT_TYPE,
+            bytes: manifest_bytes,
+        },
+    );
+
+    let (reducer_wasm_path, reducer_wasm) = match load_bundle_file(
+        &bundle_dir,
+        "ui_wasm",
+        &manifest.ui_wasm,
+        false,
+        "X07DEVHOST_UI_WASM_READ_FAILED",
+        "failed to read reducer wasm",
+    ) {
         Ok(v) => v,
-        Err(err) => {
-            diagnostics.push(diag(
-                "X07DEVHOST_UI_WASM_READ_FAILED",
-                "error",
-                "run",
-                format!(
-                    "failed to read reducer wasm {}: {err}",
-                    reducer_wasm_path.display()
-                ),
-                None,
-            ));
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
             return emit_and_exit(
                 raw_argv,
                 started,
@@ -388,8 +417,60 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         }
     };
     inputs.push(file_digest_bytes(&reducer_wasm_path, &reducer_wasm));
+    bundle_files.insert(
+        serve_path_for(&manifest.ui_wasm.path),
+        ServedFile {
+            content_type: "application/wasm",
+            bytes: reducer_wasm,
+        },
+    );
 
-    let state = Arc::new(HostState { reducer_wasm });
+    for (role, file_ref) in [
+        (
+            "profile",
+            manifest.profile.as_ref().map(|profile| &profile.file),
+        ),
+        ("capabilities", manifest.capabilities.as_ref()),
+        ("telemetry_profile", manifest.telemetry_profile.as_ref()),
+    ] {
+        let Some(file_ref) = file_ref else {
+            continue;
+        };
+        let (path, bytes) = match load_bundle_file(
+            &bundle_dir,
+            role,
+            file_ref,
+            true,
+            "X07DEVHOST_BUNDLE_JSON_READ_FAILED",
+            "failed to read bundle JSON sidecar",
+        ) {
+            Ok(v) => v,
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                return emit_and_exit(
+                    raw_argv,
+                    started,
+                    &bundle_dir,
+                    false,
+                    false,
+                    diagnostics,
+                    inputs,
+                    outputs,
+                    args.json,
+                );
+            }
+        };
+        inputs.push(file_digest_bytes(&path, &bytes));
+        bundle_files.insert(
+            serve_path_for(&file_ref.path),
+            ServedFile {
+                content_type: JSON_CONTENT_TYPE,
+                bytes,
+            },
+        );
+    }
+
+    let state = Arc::new(HostState { bundle_files });
     let run_state = Arc::new(Mutex::new(RunState {
         ui_ready: false,
         ui_error: None,
@@ -615,17 +696,132 @@ fn handle_custom_protocol(
                 Cow::Borrowed(bytes),
             )
         }
-        "/ui/reducer.wasm" => response_bytes(
-            StatusCode::OK,
-            "application/wasm",
-            Cow::Owned(state.reducer_wasm.clone()),
-        ),
-        _ => response_bytes(
-            StatusCode::NOT_FOUND,
-            "text/plain; charset=utf-8",
-            Cow::Borrowed(b"not found"),
-        ),
+        _ => {
+            if let Some(file) = state.bundle_files.get(path) {
+                response_bytes(
+                    StatusCode::OK,
+                    file.content_type,
+                    Cow::Owned(file.bytes.clone()),
+                )
+            } else {
+                response_bytes(
+                    StatusCode::NOT_FOUND,
+                    "text/plain; charset=utf-8",
+                    Cow::Borrowed(b"not found"),
+                )
+            }
+        }
     }
+}
+
+fn load_bundle_file(
+    bundle_dir: &Path,
+    role: &str,
+    file_ref: &BundleManifestFile,
+    expect_json: bool,
+    read_error_code: &str,
+    read_error_message: &str,
+) -> std::result::Result<(PathBuf, Vec<u8>), Diagnostic> {
+    let path = resolve_bundle_path(bundle_dir, &file_ref.path).map_err(|message| {
+        diag(
+            "X07DEVHOST_BUNDLE_FILE_PATH_INVALID",
+            "error",
+            "parse",
+            message,
+            Some(btreemap1("role", Value::String(role.to_string()))),
+        )
+    })?;
+    let bytes = std::fs::read(&path).map_err(|err| {
+        diag(
+            read_error_code,
+            "error",
+            "run",
+            format!("{read_error_message} {}: {err}", path.display()),
+            Some(btreemap1("role", Value::String(role.to_string()))),
+        )
+    })?;
+    if bytes.len() as u64 != file_ref.bytes_len {
+        let mut data = BTreeMap::new();
+        data.insert("role".to_string(), Value::String(role.to_string()));
+        data.insert(
+            "expected_bytes_len".to_string(),
+            Value::Number(file_ref.bytes_len.into()),
+        );
+        data.insert(
+            "actual_bytes_len".to_string(),
+            Value::Number((bytes.len() as u64).into()),
+        );
+        return Err(diag(
+            "X07DEVHOST_BUNDLE_FILE_SIZE_MISMATCH",
+            "error",
+            "parse",
+            format!("bundle file size mismatch for {}", path.display()),
+            Some(data),
+        ));
+    }
+    let actual_sha256 = sha256_hex(&bytes);
+    if actual_sha256 != file_ref.sha256 {
+        let mut data = BTreeMap::new();
+        data.insert("role".to_string(), Value::String(role.to_string()));
+        data.insert(
+            "expected_sha256".to_string(),
+            Value::String(file_ref.sha256.clone()),
+        );
+        data.insert("actual_sha256".to_string(), Value::String(actual_sha256));
+        return Err(diag(
+            "X07DEVHOST_BUNDLE_FILE_DIGEST_MISMATCH",
+            "error",
+            "parse",
+            format!("bundle file digest mismatch for {}", path.display()),
+            Some(data),
+        ));
+    }
+    if expect_json {
+        serde_json::from_slice::<Value>(&bytes).map_err(|err| {
+            let mut data = BTreeMap::new();
+            data.insert("role".to_string(), Value::String(role.to_string()));
+            data.insert(
+                "path".to_string(),
+                Value::String(path.display().to_string()),
+            );
+            diag(
+                "X07DEVHOST_BUNDLE_JSON_PARSE_FAILED",
+                "error",
+                "parse",
+                format!(
+                    "failed to parse bundle JSON sidecar {}: {err}",
+                    path.display()
+                ),
+                Some(data),
+            )
+        })?;
+    }
+    Ok((path, bytes))
+}
+
+fn resolve_bundle_path(bundle_dir: &Path, rel_path: &str) -> std::result::Result<PathBuf, String> {
+    let rel = Path::new(rel_path);
+    if rel.as_os_str().is_empty() {
+        return Err("bundle file path is empty".to_string());
+    }
+    if rel.is_absolute() {
+        return Err(format!("bundle file path must be relative: {rel_path}"));
+    }
+    if rel.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(format!(
+            "bundle file path must stay within the bundle root: {rel_path}"
+        ));
+    }
+    Ok(bundle_dir.join(rel))
+}
+
+fn serve_path_for(rel_path: &str) -> String {
+    format!("/{}", rel_path.trim_start_matches('/'))
 }
 
 fn response_bytes(
@@ -777,4 +973,74 @@ fn emit_and_exit(
     }
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_manifest_sidecars_deserialize() {
+        let doc = serde_json::from_value::<BundleManifestDoc>(serde_json::json!({
+            "schema_version": "x07.device.bundle.manifest@0.1.0",
+            "kind": "device_bundle",
+            "target": "desktop",
+            "profile": {
+                "id": "device_desktop_dev",
+                "v": 1,
+                "file": {
+                    "path": "profile/device.profile.json",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "bytes_len": 123
+                }
+            },
+            "capabilities": {
+                "path": "profile/device.capabilities.json",
+                "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "bytes_len": 456
+            },
+            "telemetry_profile": {
+                "path": "profile/device.telemetry.profile.json",
+                "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "bytes_len": 789
+            },
+            "ui_wasm": {
+                "path": "ui/reducer.wasm",
+                "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "bytes_len": 42
+            },
+            "host": {
+                "kind": "webview_v1",
+                "abi_name": "webview_host_v1",
+                "abi_version": "0.1.0",
+                "host_abi_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            },
+            "bundle_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }))
+        .expect("bundle manifest should deserialize");
+
+        assert_eq!(
+            doc.profile
+                .as_ref()
+                .map(|profile| profile.file.path.as_str()),
+            Some("profile/device.profile.json")
+        );
+        assert_eq!(
+            doc.capabilities.as_ref().map(|file| file.path.as_str()),
+            Some("profile/device.capabilities.json")
+        );
+        assert_eq!(
+            doc.telemetry_profile
+                .as_ref()
+                .map(|file| file.path.as_str()),
+            Some("profile/device.telemetry.profile.json")
+        );
+    }
+
+    #[test]
+    fn resolve_bundle_path_rejects_parent_escape() {
+        let err = resolve_bundle_path(Path::new("bundle"), "../secrets.json")
+            .expect_err("path traversal should be rejected");
+        assert!(err.contains("bundle root"));
+    }
 }

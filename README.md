@@ -47,7 +47,7 @@ x07-device-host-desktop --version
 Fallback:
 
 ```bash
-cargo install --locked x07-device-host-desktop --version 0.1.4
+cargo install --locked x07-device-host-desktop --version 0.1.5
 ```
 
 Use the git install path only when you need unreleased development state from this repo:
@@ -62,7 +62,7 @@ Print the current host ABI hash:
 ./target/debug/x07-device-host-desktop --host-abi-hash
 ```
 
-Run a device bundle (loads `bundle.manifest.json` + `ui/reducer.wasm`):
+Run a device bundle (loads `bundle.manifest.json`, `ui/reducer.wasm`, and any embedded profile sidecars):
 
 ```bash
 ./target/debug/x07-device-host-desktop run --bundle dist/device
@@ -78,6 +78,14 @@ x07-wasm device package --bundle dist/device --target android --out-dir dist/and
 ```
 
 Generated projects embed the device bundle under `x07/` — no remote code loading at runtime.
+
+Current device bundles may embed these sidecars under `profile/`:
+
+- `device.profile.json`
+- `device.capabilities.json`
+- `device.telemetry.profile.json`
+
+The host bootstrap consumes the capabilities sidecar from `bundle.manifest.json` when no `app.manifest.json` is present, so reducer-side network allowlists still apply in packaged device apps. The telemetry profile sidecar is carried and validated as part of the bundle surface, but this repo does not add telemetry export behavior here.
 
 ## Links
 

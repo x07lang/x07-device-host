@@ -21,11 +21,25 @@ async function loadJsonIfOk(url) {
   }
 }
 
+function bundleRefUrl(fileRef) {
+  if (!fileRef || typeof fileRef !== "object") return null;
+  const path = typeof fileRef.path === "string" ? fileRef.path : null;
+  if (!path) return null;
+  return path.startsWith("./") ? path : `./${path}`;
+}
+
+async function loadBundleSidecar(bundleManifest, key) {
+  const url = bundleRefUrl(bundleManifest?.[key] ?? null);
+  if (!url) return null;
+  return (await loadJsonIfOk(url)) || null;
+}
+
 async function main() {
   const root = document.getElementById("app");
   if (!root) throw new Error("missing #app");
 
   const manifest = (await loadJsonIfOk("./app.manifest.json")) || null;
+  const bundleManifest = (await loadJsonIfOk("./bundle.manifest.json")) || null;
 
   const defaultWasmUrl = hasIpc() ? "./ui/reducer.wasm" : "./app.wasm";
   const wasmUrl = manifest?.wasmUrl ?? manifest?.wasm_url ?? defaultWasmUrl;
@@ -38,6 +52,9 @@ async function main() {
   const capabilitiesUrl = manifest?.capabilitiesUrl ?? manifest?.capabilities_url ?? null;
   if (!capabilities && typeof capabilitiesUrl === "string" && capabilitiesUrl) {
     capabilities = (await loadJsonIfOk(capabilitiesUrl)) || null;
+  }
+  if (!capabilities) {
+    capabilities = (await loadBundleSidecar(bundleManifest, "capabilities")) || null;
   }
 
   let componentEsmUrl = null;
@@ -73,4 +90,3 @@ async function main() {
 }
 
 main();
-
