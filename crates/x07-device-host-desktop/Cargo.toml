@@ -1,6 +1,6 @@
 [package]
 name = "x07-device-host-desktop"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "Apache-2.0"
 description = "Desktop system-WebView host for X07 device bundles."
@@ -14,11 +14,14 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.86"
 clap = { version = "4.5.4", features = ["derive"] }
+opentelemetry-proto = { version = "0.31.0", default-features = false, features = ["gen-tonic-messages", "logs", "prost", "with-serde"] }
+prost = "0.14.3"
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.8"
 tao = "0.34.5"
 wry = "0.54.1"
 
-x07-device-host-abi = { path = "../x07-device-host-abi", version = "0.1.6" }
-x07-device-host-assets = { path = "../x07-device-host-assets", version = "0.1.6" }
+x07-device-host-abi = { path = "../x07-device-host-abi", version = "0.1.7" }
+x07-device-host-assets = { path = "../x07-device-host-assets", version = "0.1.7" }

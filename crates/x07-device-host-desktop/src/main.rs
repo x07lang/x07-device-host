@@ -16,6 +16,8 @@ use tao::window::WindowBuilder;
 use wry::http::{Method, Request, Response, StatusCode};
 use wry::WebViewBuilder;
 
+mod telemetry;
+
 const BUNDLE_MANIFEST_FILE: &str = "bundle.manifest.json";
 const RUN_REPORT_SCHEMA_VERSION: &str = "x07.wasm.device.run.report@0.1.0";
 const RUN_REPORT_COMMAND: &str = "x07-wasm.device.run";
@@ -239,6 +241,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
                 diagnostics,
                 inputs,
                 outputs,
+                false,
                 args.json,
             );
         }
@@ -268,6 +271,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
                 diagnostics,
                 inputs,
                 outputs,
+                false,
                 args.json,
             );
         }
@@ -295,6 +299,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
                 diagnostics,
                 inputs,
                 outputs,
+                false,
                 args.json,
             );
         }
@@ -322,6 +327,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
             diagnostics,
             inputs,
             outputs,
+            manifest.telemetry_profile.is_some(),
             args.json,
         );
     }
@@ -348,6 +354,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
             diagnostics,
             inputs,
             outputs,
+            manifest.telemetry_profile.is_some(),
             args.json,
         );
     }
@@ -379,6 +386,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
             diagnostics,
             inputs,
             outputs,
+            manifest.telemetry_profile.is_some(),
             args.json,
         );
     }
@@ -412,6 +420,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
                 diagnostics,
                 inputs,
                 outputs,
+                manifest.telemetry_profile.is_some(),
                 args.json,
             );
         }
@@ -456,6 +465,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
                     diagnostics,
                     inputs,
                     outputs,
+                    manifest.telemetry_profile.is_some(),
                     args.json,
                 );
             }
@@ -476,6 +486,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         ui_error: None,
         timeout: false,
     }));
+    let telemetry = Arc::new(telemetry::TelemetryCoordinator::new()?);
 
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -494,13 +505,19 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
     let protocol_state = state.clone();
     let ipc_proxy = proxy.clone();
     let ipc_run_state = run_state.clone();
+    let ipc_telemetry = telemetry.clone();
     let _webview = WebViewBuilder::new()
         .with_custom_protocol("x07".to_string(), move |_id, request| {
             handle_custom_protocol(protocol_state.clone(), request)
         })
         .with_navigation_handler(|nav_url| navigation_allowed(&nav_url))
         .with_ipc_handler(move |request| {
-            handle_ipc(&ipc_proxy, &ipc_run_state, request.body().to_string());
+            handle_ipc(
+                &ipc_proxy,
+                &ipc_run_state,
+                &ipc_telemetry,
+                request.body().to_string(),
+            );
         })
         .with_url(url)
         .build(&window)
@@ -511,6 +528,12 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
     let final_state = run_state.lock().expect("lock run_state");
     let ui_ready = final_state.ui_ready;
     if let Some(err) = final_state.ui_error.clone() {
+        telemetry.emit_native_event(
+            "host.webview_crash",
+            "host.webview_crash",
+            "error",
+            btreemap1("message", Value::String(err.clone())),
+        );
         diagnostics.push(diag(
             "X07DEVHOST_ASSET_LOAD_FAILED",
             "error",
@@ -540,6 +563,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         diagnostics,
         inputs,
         outputs,
+        manifest.telemetry_profile.is_some(),
         args.json,
     )
 }
@@ -587,12 +611,21 @@ fn run_event_loop(
     unreachable!("unsupported platform for x07-device-host-desktop");
 }
 
-fn handle_ipc(proxy: &EventLoopProxy<UserEvent>, run_state: &Arc<Mutex<RunState>>, msg: String) {
+fn handle_ipc(
+    proxy: &EventLoopProxy<UserEvent>,
+    run_state: &Arc<Mutex<RunState>>,
+    telemetry: &Arc<telemetry::TelemetryCoordinator>,
+    msg: String,
+) {
     if msg.len() > 128 * 1024 {
         if let Ok(mut st) = run_state.lock() {
             st.ui_error = Some("ipc message too large".to_string());
         }
         let _ = proxy.send_event(UserEvent::UiError);
+        return;
+    }
+
+    if telemetry.try_handle_ipc(&msg) {
         return;
     }
 
@@ -922,6 +955,7 @@ fn emit_and_exit(
     diagnostics: Vec<Diagnostic>,
     inputs: Vec<FileDigest>,
     outputs: Vec<FileDigest>,
+    telemetry_enabled: bool,
     json: bool,
 ) -> Result<u8> {
     let exit_code = if ok { 0 } else { 2 };
@@ -948,7 +982,7 @@ fn emit_and_exit(
         outputs,
         nondeterminism: Nondeterminism {
             uses_os_time: false,
-            uses_network: false,
+            uses_network: telemetry_enabled,
             uses_process: true,
         },
     };

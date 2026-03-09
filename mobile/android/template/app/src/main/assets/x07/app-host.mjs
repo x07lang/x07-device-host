@@ -204,6 +204,327 @@ function stableJson(value) {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(",")}}`;
 }
 
+function sanitizeTelemetryValue(raw) {
+  if (raw == null) return null;
+  const t = typeof raw;
+  if (t === "string" || t === "boolean") return raw;
+  if (t === "number") return Number.isFinite(raw) ? raw : null;
+  if (Array.isArray(raw)) return stableJson(raw);
+  if (t === "object") return stableJson(raw);
+  return String(raw);
+}
+
+function collectTelemetryAttributes(raw) {
+  const obj = raw && typeof raw === "object" ? raw : {};
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (!k) continue;
+    const clean = sanitizeTelemetryValue(v);
+    if (clean == null) continue;
+    out[k] = clean;
+  }
+  return out;
+}
+
+function otlpSeverity(raw) {
+  const severity = String(raw ?? "info").toLowerCase();
+  switch (severity) {
+    case "trace":
+      return { number: 1, text: "TRACE" };
+    case "debug":
+      return { number: 5, text: "DEBUG" };
+    case "warn":
+    case "warning":
+      return { number: 13, text: "WARN" };
+    case "error":
+      return { number: 17, text: "ERROR" };
+    case "fatal":
+      return { number: 21, text: "FATAL" };
+    default:
+      return { number: 9, text: "INFO" };
+  }
+}
+
+function otlpAnyValuePayload(raw) {
+  if (raw == null) return { stringValue: "" };
+  if (typeof raw === "string") return { stringValue: raw };
+  if (typeof raw === "boolean") return { boolValue: raw };
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) return { stringValue: String(raw) };
+    if (Number.isInteger(raw)) return { intValue: String(raw) };
+    return { doubleValue: raw };
+  }
+  return { stringValue: stableJson(raw) };
+}
+
+function otlpAttributeItems(raw) {
+  const attrs = collectTelemetryAttributes(raw);
+  return Object.entries(attrs).map(([key, value]) => ({
+    key,
+    value: otlpAnyValuePayload(value),
+  }));
+}
+
+function encodeProtoTag(fieldNumber, wireType) {
+  return encodeProtoVarint((fieldNumber << 3) | wireType);
+}
+
+function encodeProtoVarint(raw) {
+  let value = typeof raw === "bigint" ? raw : BigInt(raw >>> 0 === raw ? raw : Math.trunc(raw));
+  if (value < 0n) {
+    value = BigInt.asUintN(64, value);
+  }
+  const out = [];
+  do {
+    let byte = Number(value & 0x7fn);
+    value >>= 7n;
+    if (value !== 0n) byte |= 0x80;
+    out.push(byte);
+  } while (value !== 0n);
+  return Uint8Array.from(out);
+}
+
+function encodeProtoLengthDelimited(fieldNumber, payload) {
+  return concatProtoBytes([
+    encodeProtoTag(fieldNumber, 2),
+    encodeProtoVarint(payload.length),
+    payload,
+  ]);
+}
+
+function encodeProtoString(fieldNumber, value) {
+  return encodeProtoLengthDelimited(fieldNumber, textEncoder.encode(String(value ?? "")));
+}
+
+function encodeProtoFixed64(fieldNumber, value) {
+  const out = new Uint8Array(1 + 8 + 9);
+  const tag = encodeProtoTag(fieldNumber, 1);
+  out.set(tag, 0);
+  let cursor = tag.length;
+  let current = typeof value === "bigint" ? value : BigInt(value);
+  for (let i = 0; i < 8; i += 1) {
+    out[cursor + i] = Number(current & 0xffn);
+    current >>= 8n;
+  }
+  return out.slice(0, cursor + 8);
+}
+
+function encodeProtoDouble(fieldNumber, value) {
+  const tag = encodeProtoTag(fieldNumber, 1);
+  const bytes = new Uint8Array(tag.length + 8);
+  bytes.set(tag, 0);
+  const view = new DataView(bytes.buffer, tag.length, 8);
+  view.setFloat64(0, Number(value ?? 0), true);
+  return bytes;
+}
+
+function concatProtoBytes(parts) {
+  const items = Array.isArray(parts) ? parts : [];
+  const total = items.reduce((sum, item) => sum + (item?.length ?? 0), 0);
+  const out = new Uint8Array(total);
+  let cursor = 0;
+  for (const item of items) {
+    if (!item || !item.length) continue;
+    out.set(item, cursor);
+    cursor += item.length;
+  }
+  return out;
+}
+
+function encodeProtoAnyValue(raw) {
+  if (raw == null) return encodeProtoString(1, "");
+  if (typeof raw === "string") return encodeProtoString(1, raw);
+  if (typeof raw === "boolean") {
+    return concatProtoBytes([encodeProtoTag(2, 0), encodeProtoVarint(raw ? 1 : 0)]);
+  }
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) return encodeProtoString(1, String(raw));
+    if (Number.isInteger(raw)) {
+      return concatProtoBytes([encodeProtoTag(3, 0), encodeProtoVarint(BigInt(raw))]);
+    }
+    return encodeProtoDouble(4, raw);
+  }
+  return encodeProtoString(1, stableJson(raw));
+}
+
+function encodeProtoKeyValue(key, value) {
+  return concatProtoBytes([
+    encodeProtoString(1, key),
+    encodeProtoLengthDelimited(2, encodeProtoAnyValue(value)),
+  ]);
+}
+
+function encodeProtoAttributes(raw) {
+  return otlpAttributeItems(raw).map((item) =>
+    encodeProtoLengthDelimited(1, encodeProtoKeyValue(item.key, item.value.stringValue ?? item.value.boolValue ?? item.value.intValue ?? item.value.doubleValue ?? ""))
+  );
+}
+
+function encodeProtoInstrumentationScope(name, version) {
+  return concatProtoBytes([encodeProtoString(1, name), encodeProtoString(2, version)]);
+}
+
+function logRecordBody(rawBody, name) {
+  const body = typeof rawBody === "string" && rawBody ? rawBody : String(name ?? "");
+  return body || "event";
+}
+
+function timeUnixNanoBigInt(timeUnixMs) {
+  const millis = Number.isFinite(Number(timeUnixMs)) ? Math.trunc(Number(timeUnixMs)) : Date.now();
+  return BigInt(millis) * 1000000n;
+}
+
+function buildOtlpLogWire(resource, event, scopeName, scopeVersion) {
+  const severity = otlpSeverity(event?.severity ?? "info");
+  const body = logRecordBody(event?.body, event?.name);
+  const eventAttributes = {
+    "x07.event.class": String(event?.class ?? ""),
+    "x07.event.name": String(event?.name ?? ""),
+    ...(event?.attributes && typeof event.attributes === "object" ? event.attributes : {}),
+  };
+  const timeUnixNano = timeUnixNanoBigInt(event?.time_unix_ms ?? Date.now());
+  const jsonPayload = {
+    resourceLogs: [
+      {
+        resource: {
+          attributes: otlpAttributeItems(resource),
+        },
+        scopeLogs: [
+          {
+            scope: {
+              name: scopeName,
+              version: scopeVersion,
+            },
+            logRecords: [
+              {
+                timeUnixNano: timeUnixNano.toString(),
+                severityNumber: severity.number,
+                severityText: severity.text,
+                body: otlpAnyValuePayload(body),
+                attributes: otlpAttributeItems(eventAttributes),
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const resourceMessage = concatProtoBytes(encodeProtoAttributes(resource));
+  const logRecordMessage = concatProtoBytes([
+    encodeProtoFixed64(1, timeUnixNano),
+    encodeProtoLengthDelimited(5, encodeProtoAnyValue(body)),
+    concatProtoBytes([encodeProtoTag(6, 0), encodeProtoVarint(severity.number)]),
+    encodeProtoString(7, severity.text),
+    ...otlpAttributeItems(eventAttributes).map((item) =>
+      encodeProtoLengthDelimited(8, encodeProtoKeyValue(item.key, item.value.stringValue ?? item.value.boolValue ?? item.value.intValue ?? item.value.doubleValue ?? ""))
+    ),
+  ]);
+  const scopeLogsMessage = concatProtoBytes([
+    encodeProtoLengthDelimited(1, encodeProtoInstrumentationScope(scopeName, scopeVersion)),
+    encodeProtoLengthDelimited(2, logRecordMessage),
+  ]);
+  const resourceLogsMessage = concatProtoBytes([
+    encodeProtoLengthDelimited(1, resourceMessage),
+    encodeProtoLengthDelimited(2, scopeLogsMessage),
+  ]);
+  const protobufPayload = encodeProtoLengthDelimited(1, resourceLogsMessage);
+  return {
+    json: jsonPayload,
+    protobuf_b64: globalThis.btoa
+      ? globalThis.btoa(String.fromCharCode(...protobufPayload))
+      : null,
+  };
+}
+
+export function createDeviceTelemetryRuntime({
+  postIpc,
+  telemetryProfile = null,
+  bundleManifest = null,
+  deviceProfile = null,
+} = {}) {
+  const noop = {
+    configure() {},
+    emit() {},
+    getResource: () => ({}),
+  };
+
+  if (!postIpc || typeof postIpc !== "function") return noop;
+  if (!telemetryProfile || typeof telemetryProfile !== "object") return noop;
+
+  const transport = telemetryProfile.transport;
+  if (!transport || typeof transport !== "object") return noop;
+  const protocol = String(transport.protocol ?? "");
+  const endpoint = String(transport.endpoint ?? "");
+  if ((protocol !== "http/json" && protocol !== "http/protobuf") || !/^https?:\/\//.test(endpoint)) {
+    return noop;
+  }
+
+  const allowed = new Set(
+    (Array.isArray(telemetryProfile.event_classes) ? telemetryProfile.event_classes : [])
+      .map((name) => String(name ?? ""))
+      .filter(Boolean),
+  );
+  if (allowed.size === 0) return noop;
+
+  const profileResource =
+    telemetryProfile.resource && typeof telemetryProfile.resource === "object"
+      ? telemetryProfile.resource
+      : {};
+  const resource = collectTelemetryAttributes({
+    "x07.app_id": profileResource.app_id ?? deviceProfile?.identity?.app_id ?? null,
+    "x07.target": profileResource.target ?? bundleManifest?.target ?? deviceProfile?.target ?? null,
+    "x07.release.exec_id": profileResource.release_exec_id ?? null,
+    "x07.release.plan_id": profileResource.release_plan_id ?? null,
+    "x07.package.sha256": profileResource.package_sha256 ?? bundleManifest?.bundle_digest ?? null,
+    "x07.provider.kind": profileResource.provider_kind ?? null,
+    "x07.provider.lane": profileResource.provider_lane ?? null,
+    "x07.rollout.percent": profileResource.rollout_percent ?? null,
+  });
+  let configured = false;
+  const scopeName = "x07-device-host-webview";
+  const scopeVersion = "0.1.7";
+
+  function configure() {
+    if (configured) return;
+    configured = true;
+    postIpc({
+      v: 1,
+      kind: "x07.device.telemetry.configure",
+      transport: { protocol, endpoint },
+      resource,
+      event_classes: Array.from(allowed.values()),
+    });
+  }
+
+  function emit(eventClass, name, attributes = {}, options = {}) {
+    if (!allowed.has(String(eventClass ?? ""))) return;
+    configure();
+    const event = {
+      class: String(eventClass ?? ""),
+      name: String(name ?? ""),
+      severity: String(options.severity ?? "info"),
+      time_unix_ms: Date.now(),
+      body: typeof options.body === "string" ? options.body : null,
+      attributes: collectTelemetryAttributes(attributes),
+    };
+    postIpc({
+      v: 1,
+      kind: "x07.device.telemetry.event",
+      transport: { protocol, endpoint },
+      resource,
+      event,
+      wire: buildOtlpLogWire(resource, event, scopeName, scopeVersion),
+    });
+  }
+
+  return {
+    configure,
+    emit,
+    getResource: () => ({ ...resource }),
+  };
+}
+
 function buildAllowedEventsMap(node, out) {
   if (!node || typeof node !== "object") return;
   const key = node.key != null ? String(node.key) : "";
@@ -789,9 +1110,26 @@ export async function mountWebUiApp({
   appMeta = null,
   capabilities = null,
   policySnapshotSha256 = null,
+  telemetry = null,
 } = {}) {
   if (!wasmUrl && !componentEsmUrl) throw new Error("missing wasmUrl/componentEsmUrl");
   if (!root) throw new Error("missing root");
+
+  function emitTelemetry(eventClass, name, attributes = {}, options = {}) {
+    if (!telemetry || typeof telemetry.emit !== "function") return;
+    telemetry.emit(eventClass, name, attributes, options);
+  }
+
+  function reportDispatchError(stage, err, attributes = {}) {
+    const msg = String(err?.message ?? err);
+    emitTelemetry(
+      "runtime.error",
+      "runtime.error",
+      { stage, message: msg, ...attributes },
+      { body: String(err?.stack ?? msg), severity: "error" },
+    );
+    console.error(err);
+  }
 
   const trace = {
     v: 1,
@@ -891,6 +1229,11 @@ export async function mountWebUiApp({
     const frameText = textDecoder.decode(outBytes);
     const frame = JSON.parse(frameText);
     trace.steps.push({ env, frame, wallMs });
+    emitTelemetry("reducer.timing", initCall ? "reducer.init" : "reducer.dispatch", {
+      reducer_kind: app?.kind ?? "unknown",
+      wall_ms: Math.round(wallMs),
+      input_bytes_len: inputBytes.length,
+    });
     return { frame, wallMs };
   }
 
@@ -929,6 +1272,8 @@ export async function mountWebUiApp({
     let frame = firstFrame;
     let uiMs = uiWallMs0;
     let httpMs = 0;
+    let loopCount = 0;
+    let effectCount = 0;
     const exchanges = [];
 
     for (let i = 0; i < MAX_EFFECT_LOOPS; i++) {
@@ -937,6 +1282,8 @@ export async function mountWebUiApp({
       if (effects.length > MAX_EFFECTS_PER_STEP) {
         throw new Error(`too many effects: n=${effects.length} max=${MAX_EFFECTS_PER_STEP}`);
       }
+      loopCount += 1;
+      effectCount += effects.length;
 
       const delta = {};
       const injectedState = state && typeof state === "object" ? { ...state } : {};
@@ -981,7 +1328,24 @@ export async function mountWebUiApp({
             reqHeaders.set(k, v);
           }
 
-          enforceFetchAllowed(capabilities, url);
+          try {
+            enforceFetchAllowed(capabilities, url);
+          } catch (err) {
+            const msg = String(err?.message ?? err);
+            emitTelemetry(
+              "policy.violation",
+              "policy.fetch.denied",
+              {
+                url,
+                method: reqEnv.method,
+                path: reqEnv.path,
+                request_id: reqEnv.id,
+                message: msg,
+              },
+              { body: String(err?.stack ?? msg), severity: "warn" },
+            );
+            throw err;
+          }
           const startedHttp = performance.now();
           const resp = await fetch(url, {
             method: reqEnv.method,
@@ -989,7 +1353,8 @@ export async function mountWebUiApp({
             body: reqBodyBytes.length ? reqBodyBytes : undefined,
           });
           const respBuf = new Uint8Array(await resp.arrayBuffer());
-          httpMs += performance.now() - startedHttp;
+          const httpElapsedMs = performance.now() - startedHttp;
+          httpMs += httpElapsedMs;
 
           if (respBuf.length > MAX_HTTP_BODY_BYTES) {
             throw new Error(
@@ -1010,6 +1375,14 @@ export async function mountWebUiApp({
           };
 
           exchanges.push({ request: reqEnv, response: respEnv });
+          emitTelemetry("app.http", "app.http", {
+            request_id: reqEnv.id,
+            method: reqEnv.method,
+            path: reqEnv.path,
+            status: resp.status,
+            duration_ms: Math.round(httpElapsedMs),
+            response_bytes_len: respBuf.length,
+          });
 
           injectedState.__x07_http = { response: respEnv };
           addInjectionDelta(delta, "__x07_http", { response: respEnv });
@@ -1125,6 +1498,16 @@ export async function mountWebUiApp({
       });
     }
 
+    emitTelemetry("bridge.timing", "bridge.dispatch", {
+      event_type: String(event?.type ?? "unknown"),
+      effect_loops: loopCount,
+      effect_count: effectCount,
+      http_exchange_count: exchanges.length,
+      ui_ms: Math.round(uiMs),
+      http_ms: Math.round(httpMs),
+      total_ms: Math.round(uiMs + httpMs),
+    });
+
     return frame;
   }
 
@@ -1142,6 +1525,12 @@ export async function mountWebUiApp({
     commitFrame(out.frame);
     await runEffectsLoop(event, env0, out.frame, out.wallMs);
   } catch (err) {
+    emitTelemetry(
+      "runtime.error",
+      "runtime.error",
+      { stage: "mount", message: String(err?.message ?? err) },
+      { body: String(err?.stack ?? err), severity: "error" },
+    );
     const incident = {
       v: 1,
       kind: "x07.web_ui.incident",
@@ -1165,7 +1554,9 @@ export async function mountWebUiApp({
       if (!target) return;
       if (!(allowedEvents.get(target)?.has("click") ?? false)) return;
       ev.preventDefault();
-      void dispatch({ type: "click", target }).catch((err) => console.error(err));
+      void dispatch({ type: "click", target }).catch((err) =>
+        reportDispatchError("click", err, { target }),
+      );
     },
     true,
   );
@@ -1178,7 +1569,7 @@ export async function mountWebUiApp({
       if (!(allowedEvents.get(target)?.has("input") ?? false)) return;
       const value = ev?.target?.value ?? "";
       void dispatch({ type: "input", target, value: String(value) }).catch((err) =>
-        console.error(err),
+        reportDispatchError("input", err, { target }),
       );
     },
     true,
@@ -1192,7 +1583,7 @@ export async function mountWebUiApp({
       if (!(allowedEvents.get(target)?.has("change") ?? false)) return;
       const value = ev?.target?.value ?? "";
       void dispatch({ type: "change", target, value: String(value) }).catch((err) =>
-        console.error(err),
+        reportDispatchError("change", err, { target }),
       );
     },
     true,
@@ -1205,7 +1596,9 @@ export async function mountWebUiApp({
       if (!target) return;
       if (!(allowedEvents.get(target)?.has("submit") ?? false)) return;
       ev.preventDefault();
-      void dispatch({ type: "submit", target }).catch((err) => console.error(err));
+      void dispatch({ type: "submit", target }).catch((err) =>
+        reportDispatchError("submit", err, { target }),
+      );
     },
     true,
   );

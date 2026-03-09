@@ -103,6 +103,44 @@ for needle in required_android_hardening:
         print(main_activity, file=sys.stderr)
         sys.exit(1)
 
+required_android_telemetry = [
+    "x07.device.telemetry.configure",
+    "x07.device.telemetry.event",
+    "host.webview_crash",
+    "onRenderProcessGone",
+    "application/x-protobuf",
+    "application/json",
+]
+for needle in required_android_telemetry:
+    if needle not in main_activity_src:
+        print(f"android template MainActivity missing telemetry hook: {needle}", file=sys.stderr)
+        print(main_activity, file=sys.stderr)
+        sys.exit(1)
+
+ios_webview = root / "mobile" / "ios" / "template" / "X07DeviceApp" / "X07WebView.swift"
+ios_webview_src = ios_webview.read_text(encoding="utf-8")
+required_ios_telemetry = [
+    "x07.device.telemetry.configure",
+    "x07.device.telemetry.event",
+    "host.webview_crash",
+    "webViewWebContentProcessDidTerminate",
+    "application/x-protobuf",
+    "application/json",
+]
+for needle in required_ios_telemetry:
+    if needle not in ios_webview_src:
+        print(f"ios template X07WebView missing telemetry hook: {needle}", file=sys.stderr)
+        print(ios_webview, file=sys.stderr)
+        sys.exit(1)
+
+ios_plist = root / "mobile" / "ios" / "template" / "X07DeviceApp" / "Info.plist"
+ios_plist_src = ios_plist.read_text(encoding="utf-8")
+for needle in ["NSAppTransportSecurity", "NSAllowsArbitraryLoads"]:
+    if needle not in ios_plist_src:
+        print(f"ios template Info.plist missing ATS setting: {needle}", file=sys.stderr)
+        print(ios_plist, file=sys.stderr)
+        sys.exit(1)
+
 for platform, dst_root in targets:
     for name in asset_names:
         src = canonical_assets / name
@@ -118,9 +156,43 @@ for platform, dst_root in targets:
             sys.exit(1)
 
 bootstrap_src = (canonical_assets / "bootstrap.js").read_text(encoding="utf-8")
-for needle in ["bundle.manifest.json", "loadBundleSidecar(", "capabilities"]:
+for needle in [
+    "bundle.manifest.json",
+    "loadBundleSidecar(",
+    "capabilities",
+    "createDeviceTelemetryRuntime",
+    "telemetry_profile",
+    "telemetry.configure()",
+    "installLifecycleTelemetry(telemetry)",
+]:
     if needle not in bootstrap_src:
         print(f"canonical bootstrap.js missing bundle-sidecar fallback marker: {needle}", file=sys.stderr)
+        sys.exit(1)
+
+app_host_src = (canonical_assets / "app-host.mjs").read_text(encoding="utf-8")
+for needle in [
+    "createDeviceTelemetryRuntime",
+    '"x07.device.telemetry.event"',
+    '"reducer.timing"',
+    '"bridge.timing"',
+    '"policy.violation"',
+    '"app.http"',
+]:
+    if needle not in app_host_src:
+        print(f"canonical app-host.mjs missing telemetry marker: {needle}", file=sys.stderr)
+        sys.exit(1)
+
+android_manifest = (
+    root / "mobile" / "android" / "template" / "app" / "src" / "main" / "AndroidManifest.xml"
+)
+android_manifest_src = android_manifest.read_text(encoding="utf-8")
+for needle in [
+    "android.permission.INTERNET",
+    'android:usesCleartextTraffic="true"',
+]:
+    if needle not in android_manifest_src:
+        print(f"android template manifest missing: {needle}", file=sys.stderr)
+        print(android_manifest, file=sys.stderr)
         sys.exit(1)
 
 print("ok: phase10 templates")

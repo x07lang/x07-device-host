@@ -47,7 +47,7 @@ x07-device-host-desktop --version
 Fallback:
 
 ```bash
-cargo install --locked x07-device-host-desktop --version 0.1.6
+cargo install --locked x07-device-host-desktop --version 0.1.7
 ```
 
 Use the git install path only when you need unreleased development state from this repo:
@@ -85,7 +85,25 @@ Current device bundles may embed these sidecars under `profile/`:
 - `device.capabilities.json`
 - `device.telemetry.profile.json`
 
-The host bootstrap consumes the capabilities sidecar from `bundle.manifest.json` when no `app.manifest.json` is present, so reducer-side network allowlists still apply in packaged device apps. The telemetry profile sidecar is carried and validated as part of the bundle surface, but this repo does not add telemetry export behavior here.
+The host bootstrap consumes the capabilities sidecar from `bundle.manifest.json` when no `app.manifest.json` is present, so reducer-side network allowlists still apply in packaged device apps. The telemetry profile sidecar configures native OTLP log export on desktop, iOS, and Android for both `http/json` and `http/protobuf`, including the standard `app.lifecycle`, `app.http`, `runtime.error`, `bridge.timing`, `reducer.timing`, `policy.violation`, and `host.webview_crash` event classes. The template-local host assets emit `x07.device.telemetry.configure` and `x07.device.telemetry.event`, and the Android/iOS templates route those IPC envelopes through native OTLP sinks instead of relying on the WebView network stack.
+
+Native templates now emit the `host.webview_crash` event from the platform WebView crash hooks, and the shared host assets populate the OTLP resource attributes expected by the platform release observability flow:
+
+- `x07.app_id`
+- `x07.target`
+- `x07.release.exec_id`
+- `x07.release.plan_id`
+- `x07.package.sha256`
+- `x07.provider.kind`
+- `x07.provider.lane`
+- `x07.rollout.percent`
+
+Template networking defaults now cover collector development endpoints too:
+
+- Android declares `android.permission.INTERNET` and `android:usesCleartextTraffic="true"` for HTTP OTLP collectors.
+- iOS includes `NSAllowsArbitraryLoads` so the native `URLSession` telemetry sink can reach HTTP OTLP endpoints.
+
+`scripts/ci/check_phase10.sh` validates the template asset sync plus the native telemetry hooks, crash hooks, Android cleartext support, and iOS ATS settings.
 
 ## Links
 
