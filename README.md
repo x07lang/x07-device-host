@@ -105,6 +105,19 @@ Template networking defaults now cover collector development endpoints too:
 
 `scripts/ci/check_phase10.sh` validates the template asset sync plus the native telemetry hooks, crash hooks, Android cleartext support, and iOS ATS settings.
 
+## Avoiding CI Reruns
+
+Before pushing desktop-runner changes, run:
+
+```bash
+cargo clippy -p x07-device-host-desktop --all-targets -- -D warnings
+```
+
+Two recurring CI failure modes in this repo are worth checking locally first:
+
+- Desktop bundle-loading helpers should not return a large `Diagnostic` directly in a `Result` error path; `clippy::result_large_err` is enforced in the macOS `phase9` job.
+- Ubuntu jobs that run `scripts/ci/check_phase9.sh` or `scripts/ci/check_release_ready.sh` need `xz-utils` and `libwebkit2gtk-4.1-dev`, because those gates compile the desktop host and require the system WebKit/GLib pkg-config files.
+
 ## Links
 
 - Recommended install flow:

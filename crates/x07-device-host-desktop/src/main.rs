@@ -410,7 +410,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
     ) {
         Ok(v) => v,
         Err(diagnostic) => {
-            diagnostics.push(diagnostic);
+            diagnostics.push(*diagnostic);
             return emit_and_exit(
                 raw_argv,
                 started,
@@ -455,7 +455,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         ) {
             Ok(v) => v,
             Err(diagnostic) => {
-                diagnostics.push(diagnostic);
+                diagnostics.push(*diagnostic);
                 return emit_and_exit(
                     raw_argv,
                     started,
@@ -754,24 +754,24 @@ fn load_bundle_file(
     expect_json: bool,
     read_error_code: &str,
     read_error_message: &str,
-) -> std::result::Result<(PathBuf, Vec<u8>), Diagnostic> {
+) -> std::result::Result<(PathBuf, Vec<u8>), Box<Diagnostic>> {
     let path = resolve_bundle_path(bundle_dir, &file_ref.path).map_err(|message| {
-        diag(
+        Box::new(diag(
             "X07DEVHOST_BUNDLE_FILE_PATH_INVALID",
             "error",
             "parse",
             message,
             Some(btreemap1("role", Value::String(role.to_string()))),
-        )
+        ))
     })?;
     let bytes = std::fs::read(&path).map_err(|err| {
-        diag(
+        Box::new(diag(
             read_error_code,
             "error",
             "run",
             format!("{read_error_message} {}: {err}", path.display()),
             Some(btreemap1("role", Value::String(role.to_string()))),
-        )
+        ))
     })?;
     if bytes.len() as u64 != file_ref.bytes_len {
         let mut data = BTreeMap::new();
@@ -784,13 +784,13 @@ fn load_bundle_file(
             "actual_bytes_len".to_string(),
             Value::Number((bytes.len() as u64).into()),
         );
-        return Err(diag(
+        return Err(Box::new(diag(
             "X07DEVHOST_BUNDLE_FILE_SIZE_MISMATCH",
             "error",
             "parse",
             format!("bundle file size mismatch for {}", path.display()),
             Some(data),
-        ));
+        )));
     }
     let actual_sha256 = sha256_hex(&bytes);
     if actual_sha256 != file_ref.sha256 {
@@ -801,13 +801,13 @@ fn load_bundle_file(
             Value::String(file_ref.sha256.clone()),
         );
         data.insert("actual_sha256".to_string(), Value::String(actual_sha256));
-        return Err(diag(
+        return Err(Box::new(diag(
             "X07DEVHOST_BUNDLE_FILE_DIGEST_MISMATCH",
             "error",
             "parse",
             format!("bundle file digest mismatch for {}", path.display()),
             Some(data),
-        ));
+        )));
     }
     if expect_json {
         serde_json::from_slice::<Value>(&bytes).map_err(|err| {
@@ -817,7 +817,7 @@ fn load_bundle_file(
                 "path".to_string(),
                 Value::String(path.display().to_string()),
             );
-            diag(
+            Box::new(diag(
                 "X07DEVHOST_BUNDLE_JSON_PARSE_FAILED",
                 "error",
                 "parse",
@@ -826,7 +826,7 @@ fn load_bundle_file(
                     path.display()
                 ),
                 Some(data),
-            )
+            ))
         })?;
     }
     Ok((path, bytes))

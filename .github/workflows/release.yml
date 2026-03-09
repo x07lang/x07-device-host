@@ -4,11 +4,22 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to validate and publish
+        required: true
+        type: string
+
+concurrency:
+  group: x07-device-host-release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: true
 
 permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
 jobs:
   verify_tag:
@@ -18,6 +29,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/checkout@v4
         with:
           repository: x07lang/x07
@@ -25,7 +38,7 @@ jobs:
       - name: Verify tag + ABI snapshot consistency
         shell: bash
         run: |
-          bash .release-tools/scripts/release/verify-tag.sh --repo-kind x07-device-host --tag "${GITHUB_REF_NAME}"
+          bash .release-tools/scripts/release/verify-tag.sh --repo-kind x07-device-host --tag "${RELEASE_TAG}"
           bash scripts/ci/check_phase8.sh
 
   test:
@@ -36,12 +49,23 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+      - name: Install Linux deps
+        shell: bash
+        run: |
+          # check_release_ready runs the desktop phase9 gate, so this job
+          # needs the same WebKit/GLib dependencies as the Linux desktop build.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xz-utils \
+            libwebkit2gtk-4.1-dev
       - name: Run release gate
         shell: bash
         run: |
@@ -73,6 +97,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/checkout@v4
         with:
           repository: x07lang/x07
@@ -97,7 +123,7 @@ jobs:
           X07_RELEASE_TOOLS_DIR: ${{ github.workspace }}/.release-tools/scripts/release
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           ASSET_PATH="$(bash scripts/release/build-device-host-archive.sh \
             --component x07-device-host-desktop \
             --version "${VERSION}" \
@@ -130,11 +156,13 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Package mobile templates
         id: pack
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           ASSET_PATH="$(bash scripts/release/package-mobile-templates.sh \
             --version "${VERSION}" \
             --out-dir dist/release)"
@@ -165,11 +193,13 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Export ABI snapshot asset
         id: pack
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           ASSET_PATH="$(bash scripts/release/export-device-host-abi.sh \
             --version "${VERSION}" \
             --out-dir dist/release)"
@@ -201,6 +231,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/checkout@v4
         with:
           repository: x07lang/x07
@@ -220,7 +252,7 @@ jobs:
         id: meta
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           HOST_ABI_HASH="$(python3 - <<'PY'
           import json
           from pathlib import Path
@@ -252,7 +284,7 @@ jobs:
             --schema x07.component.release@0.1.0 \
             --component x07_device_host \
             --version "${{ steps.meta.outputs.version }}" \
-            --tag "${GITHUB_REF_NAME}" \
+            --tag "${RELEASE_TAG}" \
             --repo "https://github.com/${GITHUB_REPOSITORY}" \
             --assets-dir dist/release \
             --compat-file "releases/compat/${{ steps.meta.outputs.version }}.json" \
@@ -293,19 +325,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release create "${GITHUB_REF_NAME}" \
+          if ! gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --draft \
               --verify-tag \
-              --title "${GITHUB_REF_NAME}"
+              --title "${RELEASE_TAG}"
           fi
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          gh release upload "${GITHUB_REF_NAME}" dist/release/* \
+          gh release upload "${RELEASE_TAG}" dist/release/* \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber
       - name: Publish immutable release
@@ -313,6 +345,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          gh release edit "${GITHUB_REF_NAME}" \
+          gh release edit "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
             --draft=false
