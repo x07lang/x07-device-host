@@ -9,7 +9,7 @@
       },
       {
         "path": "bootstrap.js",
-        "sha256": "f413cfc31725030c843d3e1a347d281c83c872a90e10b996b6c64db5143a89c6"
+        "sha256": "4a65b92a53ac56641e659f294aad11b186ac319610904f5c89498473d7f7e5c6"
       },
       {
         "path": "main.mjs",
@@ -22,7 +22,7 @@
     ],
     "bridge_protocol_version": "web_ui_bridge_v1"
   },
-  "host_abi_hash": "00714534e0a017577ab39387446a8c92f8b1c5d8b9c7f5dda40ff34176fc9122",
+  "host_abi_hash": "9f02eefdb02bb628e351949bb4f44b4b7d3474e1492a58687d48170bf63a6e83",
   "kind": "device_host_abi_snapshot",
   "schema_version": "x07.device.host_abi.snapshot@0.1.0"
 }

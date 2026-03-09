@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "x07-device-host-abi"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2760,11 +2760,11 @@ dependencies = [
 
 [[package]]
 name = "x07-device-host-assets"
-version = "0.1.5"
+version = "0.1.6"
 
 [[package]]
 name = "x07-device-host-desktop"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",
