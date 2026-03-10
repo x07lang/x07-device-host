@@ -47,7 +47,7 @@ x07-device-host-desktop --version
 Fallback:
 
 ```bash
-cargo install --locked x07-device-host-desktop --version 0.2.0
+cargo install --locked x07-device-host-desktop --version 0.2.1
 ```
 
 Use the git install path only when you need unreleased development state from this repo:
@@ -62,7 +62,7 @@ Print the current host ABI hash:
 ./target/debug/x07-device-host-desktop --host-abi-hash
 ```
 
-Run a device bundle (loads `bundle.manifest.json`, `ui/reducer.wasm`, and any embedded profile sidecars):
+Run a device bundle (loads `bundle.manifest.json`, `app.manifest.json` when present, `ui/reducer.wasm`, and any embedded profile sidecars):
 
 ```bash
 ./target/debug/x07-device-host-desktop run --bundle dist/device
@@ -92,7 +92,7 @@ Current device bundles may embed these sidecars under `profile/`:
 - `device.capabilities.json`
 - `device.telemetry.profile.json`
 
-The host bootstrap consumes the capabilities sidecar from `bundle.manifest.json` when no `app.manifest.json` is present, so reducer-side network allowlists still apply in packaged device apps. The telemetry profile sidecar configures native OTLP log export on desktop, iOS, and Android for both `http/json` and `http/protobuf`, including the standard `app.lifecycle`, `app.http`, `runtime.error`, `bridge.timing`, `reducer.timing`, `policy.violation`, and `host.webview_crash` event classes. The template-local host assets emit `x07.device.telemetry.configure` and `x07.device.telemetry.event`, and the Android/iOS templates route those IPC envelopes through native OTLP sinks instead of relying on the WebView network stack.
+The host now serves `app.manifest.json` directly from the bundle root so the embedded bootstrap can pick up runtime settings such as `apiPrefix`, `componentEsmUrl`, and the `webUi` solve limits emitted by `x07-wasm device build`. When `app.manifest.json` omits capabilities, the host bootstrap still falls back to the capabilities sidecar from `bundle.manifest.json`, so reducer-side network allowlists continue to apply in packaged device apps. The telemetry profile sidecar configures native OTLP log export on desktop, iOS, and Android for both `http/json` and `http/protobuf`, including the standard `app.lifecycle`, `app.http`, `runtime.error`, `bridge.timing`, `reducer.timing`, `policy.violation`, and `host.webview_crash` event classes. The template-local host assets emit `x07.device.telemetry.configure` and `x07.device.telemetry.event`, and the Android/iOS templates route those IPC envelopes through native OTLP sinks instead of relying on the WebView network stack.
 
 For the M0 native surface, the host distinguishes build-time capability allowlisting from runtime permission outcomes:
 

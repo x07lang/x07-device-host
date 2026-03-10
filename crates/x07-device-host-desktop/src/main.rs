@@ -23,6 +23,7 @@ use wry::WebViewBuilder;
 mod telemetry;
 
 const BUNDLE_MANIFEST_FILE: &str = "bundle.manifest.json";
+const APP_MANIFEST_FILE: &str = "app.manifest.json";
 const RUN_REPORT_SCHEMA_VERSION: &str = "x07.wasm.device.run.report@0.1.0";
 const RUN_REPORT_COMMAND: &str = "x07-wasm.device.run";
 const EXPECTED_BUNDLE_SCHEMA_VERSION: &str = "x07.device.bundle.manifest@0.1.0";
@@ -939,6 +940,45 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
             bytes: manifest_bytes,
         },
     );
+
+    let app_manifest_path = bundle_dir.join(APP_MANIFEST_FILE);
+    match std::fs::read(&app_manifest_path) {
+        Ok(bytes) => {
+            inputs.push(file_digest_bytes(&app_manifest_path, &bytes));
+            bundle_files.insert(
+                format!("/{APP_MANIFEST_FILE}"),
+                ServedFile {
+                    content_type: JSON_CONTENT_TYPE,
+                    bytes,
+                },
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            diagnostics.push(diag(
+                "X07DEVHOST_APP_MANIFEST_READ_FAILED",
+                "error",
+                "run",
+                format!(
+                    "failed to read app manifest {}: {err}",
+                    app_manifest_path.display()
+                ),
+                None,
+            ));
+            return emit_and_exit(
+                raw_argv,
+                started,
+                &bundle_dir,
+                false,
+                false,
+                diagnostics,
+                inputs,
+                outputs,
+                manifest.telemetry_profile.is_some(),
+                args.json,
+            );
+        }
+    }
 
     let (reducer_wasm_path, reducer_wasm) = match load_bundle_file(
         &bundle_dir,

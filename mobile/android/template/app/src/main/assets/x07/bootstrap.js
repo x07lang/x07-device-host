@@ -23,7 +23,9 @@ async function loadJsonIfOk(url) {
 
 function bundleRefUrl(fileRef) {
   if (!fileRef || typeof fileRef !== "object") return null;
-  const path = typeof fileRef.path === "string" ? fileRef.path : null;
+  const file =
+    fileRef.file && typeof fileRef.file === "object" ? fileRef.file : fileRef;
+  const path = typeof file.path === "string" ? file.path : null;
   if (!path) return null;
   return path.startsWith("./") ? path : `./${path}`;
 }
@@ -32,6 +34,101 @@ async function loadBundleSidecar(bundleManifest, key) {
   const url = bundleRefUrl(bundleManifest?.[key] ?? null);
   if (!url) return null;
   return (await loadJsonIfOk(url)) || null;
+}
+
+function deriveApiPrefix(manifest, deviceProfile) {
+  const manifestPrefix = manifest?.apiPrefix ?? manifest?.api_prefix ?? null;
+  if (typeof manifestPrefix === "string" && manifestPrefix) {
+    return manifestPrefix;
+  }
+  const backend = deviceProfile?.backend;
+  if (!backend || backend.mode !== "remote_http") {
+    return null;
+  }
+  const baseUrl = typeof backend.base_url === "string" ? backend.base_url : "";
+  return baseUrl || null;
+}
+
+function normalizeCapabilitiesForHost(capabilities, deviceProfile) {
+  if (!capabilities || typeof capabilities !== "object") {
+    return capabilities;
+  }
+  const net = capabilities.network;
+  if (net && typeof net === "object" && net.mode === "allowlist" && Array.isArray(net.allowlist)) {
+    return capabilities;
+  }
+
+  const backend = deviceProfile?.backend;
+  if (!backend || backend.mode !== "remote_http" || typeof backend.base_url !== "string") {
+    return capabilities;
+  }
+
+  try {
+    const baseUrl = new URL(backend.base_url);
+    const proto =
+      baseUrl.protocol === "https:" ? "https" : baseUrl.protocol === "http:" ? "http" : "";
+    if (!proto) return capabilities;
+    const port = baseUrl.port
+      ? Number(baseUrl.port)
+      : baseUrl.protocol === "https:"
+        ? 443
+        : 80;
+    if (!Number.isFinite(port) || port < 0 || port > 65535) {
+      return capabilities;
+    }
+
+    const allowedHosts = new Set();
+    if (Array.isArray(net?.allow_hosts)) {
+      for (const host of net.allow_hosts) {
+        if (typeof host === "string" && host) {
+          allowedHosts.add(host.toLowerCase());
+        }
+      }
+    }
+    if (Array.isArray(backend.allowed_hosts)) {
+      for (const host of backend.allowed_hosts) {
+        if (typeof host === "string" && host) {
+          allowedHosts.add(host.toLowerCase());
+        }
+      }
+    }
+    if (allowedHosts.size !== 0 && !allowedHosts.has(baseUrl.hostname.toLowerCase())) {
+      return capabilities;
+    }
+
+    return {
+      ...capabilities,
+      network: {
+        mode: "allowlist",
+        allowlist: [
+          {
+            proto,
+            host: baseUrl.hostname.toLowerCase(),
+            port,
+          },
+        ],
+      },
+    };
+  } catch (_) {
+    return capabilities;
+  }
+}
+
+function deriveWebUiRuntime(manifest) {
+  const raw = manifest?.webUi ?? manifest?.web_ui ?? null;
+  if (!raw || typeof raw !== "object") return {};
+
+  const arenaCapBytes = Number(raw.arenaCapBytes ?? raw.arena_cap_bytes ?? 0);
+  const maxOutputBytes = Number(raw.maxOutputBytes ?? raw.max_output_bytes ?? 0);
+  const out = {};
+
+  if (Number.isFinite(arenaCapBytes) && arenaCapBytes > 0) {
+    out.arenaCapBytes = arenaCapBytes;
+  }
+  if (Number.isFinite(maxOutputBytes) && maxOutputBytes > 0) {
+    out.maxOutputBytes = maxOutputBytes;
+  }
+  return out;
 }
 
 function installLifecycleTelemetry(telemetry) {
@@ -96,10 +193,11 @@ async function main() {
 
   const defaultWasmUrl = hasIpc() ? "./ui/reducer.wasm" : "./app.wasm";
   const wasmUrl = manifest?.wasmUrl ?? manifest?.wasm_url ?? defaultWasmUrl;
-  const apiPrefix = manifest?.apiPrefix ?? manifest?.api_prefix ?? null;
+  const apiPrefix = deriveApiPrefix(manifest, deviceProfile);
   const appMeta = manifest?.app ?? null;
   const policySnapshotSha256 =
     manifest?.policySnapshotSha256 ?? manifest?.policy_snapshot_sha256 ?? null;
+  const webUiRuntime = deriveWebUiRuntime(manifest);
 
   let capabilities = manifest?.capabilities ?? manifest?.caps ?? null;
   const capabilitiesUrl = manifest?.capabilitiesUrl ?? manifest?.capabilities_url ?? null;
@@ -109,6 +207,7 @@ async function main() {
   if (!capabilities) {
     capabilities = (await loadBundleSidecar(bundleManifest, "capabilities")) || null;
   }
+  capabilities = normalizeCapabilitiesForHost(capabilities, deviceProfile);
 
   let componentEsmUrl = null;
   if (manifest?.componentEsmUrl || manifest?.component_esm_url) {
@@ -130,6 +229,7 @@ async function main() {
       capabilities,
       policySnapshotSha256,
       telemetry,
+      ...webUiRuntime,
     });
     globalThis.__x07 = mounted;
     telemetry.emit("app.lifecycle", "app.ready", {

@@ -1886,7 +1886,50 @@ export async function mountWebUiApp({
   async function callReducer(env, initCall) {
     const inputBytes = textEncoder.encode(JSON.stringify(env));
     const started = performance.now();
-    const outBytes = initCall ? await app.init() : await app.step(inputBytes);
+    let outBytes;
+    try {
+      outBytes = initCall ? await app.init() : await app.step(inputBytes);
+    } catch (err) {
+      const response = env?.state?.__x07_http?.response ?? null;
+      const context = {
+        init_call: Boolean(initCall),
+        event_type: String(env?.event?.type ?? "unknown"),
+        input_bytes_len: inputBytes.length,
+        state_keys:
+          env?.state && typeof env.state === "object" && !Array.isArray(env.state)
+            ? Object.keys(env.state).sort()
+            : [],
+        http_response:
+          response && typeof response === "object"
+            ? {
+                request_id:
+                  typeof response.request_id === "string" ? response.request_id : null,
+                status: Number.isFinite(Number(response.status)) ? Number(response.status) : null,
+                headers_len: Array.isArray(response.headers) ? response.headers.length : 0,
+                body_bytes_len: Number(response?.body?.bytes_len ?? 0),
+                body_text_prefix:
+                  typeof response?.body?.text === "string"
+                    ? response.body.text.slice(0, 256)
+                    : null,
+              }
+            : null,
+        storage_get:
+          env?.state?.__x07_storage?.get && typeof env.state.__x07_storage.get === "object"
+            ? {
+                key: String(env.state.__x07_storage.get.key ?? ""),
+                value_prefix:
+                  env.state.__x07_storage.get.value == null
+                    ? null
+                    : String(env.state.__x07_storage.get.value).slice(0, 256),
+              }
+            : null,
+      };
+      const wrapped = new Error(`reducer dispatch failed: ${stableJson(context)}`);
+      wrapped.cause = err;
+      wrapped.stack = `${wrapped.message}\n${String(err?.stack ?? err)}`;
+      wrapped.x07Context = context;
+      throw wrapped;
+    }
     const wallMs = performance.now() - started;
 
     const frameText = textDecoder.decode(outBytes);
