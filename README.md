@@ -14,9 +14,9 @@ The [X07 toolchain](https://github.com/x07lang/x07) must be installed before usi
 |---------|-------------|
 | **Host assets** (`crates/x07-device-host-assets/`) | Pinned host bootstrap assets consumed by device bundles (kept in sync with the canonical web host snapshot: `vendor/x07-web-ui/host/host.snapshot.json`) |
 | **Host ABI** (`crates/x07-device-host-abi/`) | Deterministic host ABI hash used by `x07-wasm device` bundles for compatibility verification (snapshot: `arch/host_abi/host_abi.snapshot.json`) |
-| **Desktop runner** (`crates/x07-device-host-desktop/`) | System WebView runner using `tao`/`wry` (macOS, Linux, Windows) |
-| **iOS template** (`mobile/ios/template/`) | WKWebView project template with embedded host assets (store-safe, no remote code loading) |
-| **Android template** (`mobile/android/template/`) | WebViewAssetLoader project template with embedded host assets (store-safe, no remote code loading) |
+| **Desktop runner** (`crates/x07-device-host-desktop/`) | System WebView runner using `tao`/`wry` (macOS, Linux, Windows) with the M0 safe subset: file import, host-owned blob sandbox, local notifications, and deterministic `unsupported` replies for the rest |
+| **iOS template** (`mobile/ios/template/`) | WKWebView project template with embedded host assets (store-safe, no remote code loading) plus the M0 native bridge for permissions, camera, files, blobs, foreground location, and local notifications |
+| **Android template** (`mobile/android/template/`) | WebViewAssetLoader project template with embedded host assets (store-safe, no remote code loading) plus the M0 native bridge for permissions, camera, files, blobs, foreground location, and local notifications |
 
 ## Architecture
 
@@ -47,7 +47,7 @@ x07-device-host-desktop --version
 Fallback:
 
 ```bash
-cargo install --locked x07-device-host-desktop --version 0.1.7
+cargo install --locked x07-device-host-desktop --version 0.2.0
 ```
 
 Use the git install path only when you need unreleased development state from this repo:
@@ -86,6 +86,12 @@ Current device bundles may embed these sidecars under `profile/`:
 - `device.telemetry.profile.json`
 
 The host bootstrap consumes the capabilities sidecar from `bundle.manifest.json` when no `app.manifest.json` is present, so reducer-side network allowlists still apply in packaged device apps. The telemetry profile sidecar configures native OTLP log export on desktop, iOS, and Android for both `http/json` and `http/protobuf`, including the standard `app.lifecycle`, `app.http`, `runtime.error`, `bridge.timing`, `reducer.timing`, `policy.violation`, and `host.webview_crash` event classes. The template-local host assets emit `x07.device.telemetry.configure` and `x07.device.telemetry.event`, and the Android/iOS templates route those IPC envelopes through native OTLP sinks instead of relying on the WebView network stack.
+
+For the M0 native surface, the host distinguishes build-time capability allowlisting from runtime permission outcomes:
+
+- Capability checks happen before every native request.
+- Capture/import operations write bytes into a host-owned blob sandbox and return only manifests to the reducer.
+- `x07-wasm device package` projects enabled M0 capabilities into generated iOS `Info.plist` usage strings and Android runtime-permission declarations.
 
 Native templates now emit the `host.webview_crash` event from the platform WebView crash hooks, and the shared host assets populate the OTLP resource attributes expected by the platform release observability flow:
 

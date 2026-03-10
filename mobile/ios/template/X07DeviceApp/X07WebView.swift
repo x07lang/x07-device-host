@@ -1,5 +1,11 @@
+import AVFoundation
+import CoreLocation
+import CryptoKit
 import Foundation
 import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
+import UserNotifications
 import WebKit
 
 private let telemetryScopeName = "x07.device.host"
@@ -492,6 +498,308 @@ private final class TelemetryCoordinator {
   }
 }
 
+private struct NativeCapabilities {
+  let raw: [String: Any]
+
+  static func loadFromBundle() -> NativeCapabilities {
+    guard
+      let url = Bundle.main.url(forResource: "device.capabilities", withExtension: "json", subdirectory: "x07/profile"),
+      let data = try? Data(contentsOf: url),
+      let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else {
+      return NativeCapabilities(raw: [:])
+    }
+    return NativeCapabilities(raw: raw)
+  }
+
+  func allows(_ capability: String) -> Bool {
+    guard let device = raw["device"] as? [String: Any] else {
+      return false
+    }
+    switch capability {
+    case "camera.photo":
+      return ((device["camera"] as? [String: Any])?["photo"] as? Bool) == true
+    case "files.pick":
+      return ((device["files"] as? [String: Any])?["pick"] as? Bool) == true
+    case "blob_store":
+      return ((device["blob_store"] as? [String: Any])?["enabled"] as? Bool) == true
+    case "location.foreground":
+      return ((device["location"] as? [String: Any])?["foreground"] as? Bool) == true
+    case "notifications.local":
+      return ((device["notifications"] as? [String: Any])?["local"] as? Bool) == true
+    default:
+      return false
+    }
+  }
+
+  func fileAcceptDefaults() -> [String] {
+    (((raw["device"] as? [String: Any])?["files"] as? [String: Any])?["accept_defaults"] as? [String]) ?? []
+  }
+}
+
+private struct BlobManifestDoc: Codable {
+  var handle: String
+  var sha256: String
+  var mime: String
+  var byte_size: Int64
+  var created_at_ms: Int64
+  var source: String
+  var local_state: String
+
+  func payload() -> [String: Any] {
+    [
+      "handle": handle,
+      "sha256": sha256,
+      "mime": mime,
+      "byte_size": byte_size,
+      "created_at_ms": created_at_ms,
+      "source": source,
+      "local_state": local_state,
+    ]
+  }
+}
+
+private struct PendingNativeRequest {
+  let bridgeRequestId: String
+  let request: [String: Any]
+  let startedAt: Date
+}
+
+private struct PendingPermissionRequest {
+  let permission: String
+  let request: PendingNativeRequest
+}
+
+private enum NativeBlobStoreError: Error {
+  case blobItemTooLarge
+  case blobTotalTooLarge
+  case io(String)
+
+  var code: String {
+    switch self {
+    case .blobItemTooLarge:
+      return "blob_item_too_large"
+    case .blobTotalTooLarge:
+      return "blob_total_too_large"
+    case .io:
+      return "blob_io_error"
+    }
+  }
+
+  var message: String {
+    switch self {
+    case .blobItemTooLarge:
+      return "blob item exceeds max_item_bytes"
+    case .blobTotalTooLarge:
+      return "blob store exceeds max_total_bytes"
+    case let .io(message):
+      return message
+    }
+  }
+}
+
+private final class NativeBlobStore {
+  private let fileManager = FileManager.default
+  private let dataDir: URL
+  private let metaDir: URL
+  private let maxTotalBytes: Int64
+  private let maxItemBytes: Int64
+
+  init(capabilities: NativeCapabilities) throws {
+    let root = try fileManager
+      .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+      .appendingPathComponent("x07/blob_store", isDirectory: true)
+    dataDir = root.appendingPathComponent("data", isDirectory: true)
+    metaDir = root.appendingPathComponent("meta", isDirectory: true)
+    try fileManager.createDirectory(at: dataDir, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: metaDir, withIntermediateDirectories: true)
+    let blobStore = ((capabilities.raw["device"] as? [String: Any])?["blob_store"] as? [String: Any]) ?? [:]
+    maxTotalBytes = (blobStore["max_total_bytes"] as? NSNumber)?.int64Value ?? 64 * 1024 * 1024
+    maxItemBytes = (blobStore["max_item_bytes"] as? NSNumber)?.int64Value ?? 16 * 1024 * 1024
+  }
+
+  func put(data: Data, mime: String, source: String) throws -> BlobManifestDoc {
+    if Int64(data.count) > maxItemBytes {
+      throw NativeBlobStoreError.blobItemTooLarge
+    }
+    let sha256 = sha256Hex(data)
+    if let existing = try readManifest(sha256), existing.local_state == "present", fileManager.fileExists(atPath: blobURL(sha256).path) {
+      return existing
+    }
+    if try totalPresentBytes() + Int64(data.count) > maxTotalBytes {
+      throw NativeBlobStoreError.blobTotalTooLarge
+    }
+    let manifest = BlobManifestDoc(
+      handle: "blob:sha256:\(sha256)",
+      sha256: sha256,
+      mime: mime,
+      byte_size: Int64(data.count),
+      created_at_ms: unixTimeMs(),
+      source: source,
+      local_state: "present"
+    )
+    do {
+      try data.write(to: blobURL(sha256), options: .atomic)
+      try writeManifest(manifest)
+      return manifest
+    } catch {
+      throw NativeBlobStoreError.io(error.localizedDescription)
+    }
+  }
+
+  func stat(handle: String) -> BlobManifestDoc {
+    guard let sha256 = blobSha(handle) else {
+      return missingBlobManifest(handle: handle)
+    }
+    guard var manifest = try? readManifest(sha256) else {
+      return missingBlobManifest(handle: handle)
+    }
+    if manifest.local_state != "deleted", !fileManager.fileExists(atPath: blobURL(sha256).path) {
+      manifest.local_state = "missing"
+    }
+    return manifest
+  }
+
+  func delete(handle: String) throws -> BlobManifestDoc {
+    guard let sha256 = blobSha(handle) else {
+      return missingBlobManifest(handle: handle)
+    }
+    guard var manifest = try readManifest(sha256) else {
+      return missingBlobManifest(handle: handle)
+    }
+    let blobPath = blobURL(sha256).path
+    if fileManager.fileExists(atPath: blobPath) {
+      do {
+        try fileManager.removeItem(at: blobURL(sha256))
+      } catch {
+        throw NativeBlobStoreError.io(error.localizedDescription)
+      }
+    }
+    manifest.local_state = "deleted"
+    try writeManifest(manifest)
+    return manifest
+  }
+
+  private func totalPresentBytes() throws -> Int64 {
+    var total: Int64 = 0
+    let items = try fileManager.contentsOfDirectory(at: metaDir, includingPropertiesForKeys: nil)
+    for url in items where url.pathExtension == "json" {
+      guard let manifest = try readManifest(url.deletingPathExtension().lastPathComponent), manifest.local_state == "present" else {
+        continue
+      }
+      total += manifest.byte_size
+    }
+    return total
+  }
+
+  private func readManifest(_ sha256: String) throws -> BlobManifestDoc? {
+    let url = metaURL(sha256)
+    guard fileManager.fileExists(atPath: url.path) else {
+      return nil
+    }
+    let data = try Data(contentsOf: url)
+    return try JSONDecoder().decode(BlobManifestDoc.self, from: data)
+  }
+
+  private func writeManifest(_ manifest: BlobManifestDoc) throws {
+    let data = try JSONEncoder().encode(manifest)
+    try data.write(to: metaURL(manifest.sha256), options: .atomic)
+  }
+
+  private func blobURL(_ sha256: String) -> URL {
+    dataDir.appendingPathComponent("\(sha256).bin")
+  }
+
+  private func metaURL(_ sha256: String) -> URL {
+    metaDir.appendingPathComponent("\(sha256).json")
+  }
+}
+
+private func unixTimeMs() -> Int64 {
+  Int64(Date().timeIntervalSince1970 * 1000)
+}
+
+private func blobSha(_ handle: String) -> String? {
+  let prefix = "blob:sha256:"
+  guard handle.hasPrefix(prefix) else {
+    return nil
+  }
+  let value = String(handle.dropFirst(prefix.count))
+  return value.isEmpty ? nil : value
+}
+
+private func missingBlobManifest(handle: String, source: String = "blob_store") -> BlobManifestDoc {
+  BlobManifestDoc(
+    handle: handle,
+    sha256: blobSha(handle) ?? "",
+    mime: "application/octet-stream",
+    byte_size: 0,
+    created_at_ms: 0,
+    source: source,
+    local_state: "missing"
+  )
+}
+
+private func sha256Hex(_ data: Data) -> String {
+  SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+private func topViewController(from root: UIViewController?) -> UIViewController? {
+  if let nav = root as? UINavigationController {
+    return topViewController(from: nav.visibleViewController)
+  }
+  if let tab = root as? UITabBarController {
+    return topViewController(from: tab.selectedViewController)
+  }
+  if let presented = root?.presentedViewController {
+    return topViewController(from: presented)
+  }
+  return root
+}
+
+private func hostViewController(for webView: WKWebView) -> UIViewController? {
+  if let root = webView.window?.rootViewController {
+    return topViewController(from: root)
+  }
+  let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+  for scene in scenes {
+    if let root = scene.windows.first(where: \.isKeyWindow)?.rootViewController {
+      return topViewController(from: root)
+    }
+  }
+  return nil
+}
+
+private func utTypes(for accepts: [String]) -> [UTType] {
+  let values = accepts.isEmpty ? ["public.data"] : accepts
+  var out: [UTType] = []
+  for accept in values {
+    switch accept {
+    case "image/*":
+      out.append(.image)
+    case "application/pdf":
+      out.append(.pdf)
+    default:
+      if let type = UTType(mimeType: accept) {
+        out.append(type)
+      } else if let type = UTType(filenameExtension: accept.trimmingCharacters(in: CharacterSet(charactersIn: "."))) {
+        out.append(type)
+      }
+    }
+  }
+  return out.isEmpty ? [.data] : out
+}
+
+private func mimeType(for url: URL) -> String {
+  if let values = try? url.resourceValues(forKeys: [.contentTypeKey]), let type = values.contentType {
+    return type.preferredMIMEType ?? "application/octet-stream"
+  }
+  if let type = UTType(filenameExtension: url.pathExtension) {
+    return type.preferredMIMEType ?? "application/octet-stream"
+  }
+  return "application/octet-stream"
+}
+
 struct X07WebView: UIViewRepresentable {
   func makeUIView(context: Context) -> WKWebView {
     let cfg = WKWebViewConfiguration()
@@ -509,6 +817,7 @@ struct X07WebView: UIViewRepresentable {
 
     let webView = WKWebView(frame: .zero, configuration: cfg)
     webView.navigationDelegate = context.coordinator
+    context.coordinator.attach(webView: webView)
     webView.load(URLRequest(url: URL(string: "x07://localhost/index.html")!))
     return webView
   }
@@ -532,16 +841,668 @@ struct X07WebView: UIViewRepresentable {
   };
   """
 
-  final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+  final class Coordinator: NSObject, CLLocationManagerDelegate, UIDocumentPickerDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate, WKScriptMessageHandler, WKNavigationDelegate {
     private let telemetry = TelemetryCoordinator()
+    private let capabilities = NativeCapabilities.loadFromBundle()
+    private let locationManager = CLLocationManager()
+    private let blobStore: NativeBlobStore?
+    private var notificationTasks: [String: DispatchWorkItem] = [:]
+    private weak var webView: WKWebView?
+    private var pendingCameraRequest: PendingNativeRequest?
+    private var pendingFileRequest: PendingNativeRequest?
+    private var pendingLocationRequest: PendingNativeRequest?
+    private var pendingLocationTimeout: DispatchWorkItem?
+    private var pendingPermissionRequest: PendingPermissionRequest?
+    private var pendingCameraCompressionQuality: CGFloat = 0.8
+
+    override init() {
+      blobStore = try? NativeBlobStore(capabilities: capabilities)
+      super.init()
+      locationManager.delegate = self
+      locationManager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+    }
+
+    func attach(webView: WKWebView) {
+      self.webView = webView
+    }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
       _ = userContentController
       guard let payload = message.body as? String else {
         return
       }
-      if !telemetry.handleIpc(payload) {
+      if telemetry.handleIpc(payload) {
+        return
+      }
+      guard let webView = message.webView else {
+        return
+      }
+      guard let data = payload.data(using: .utf8) else {
         NSLog("x07 ipc: %@", payload)
+        return
+      }
+      guard
+        let raw = try? JSONSerialization.jsonObject(with: data),
+        let doc = raw as? [String: Any],
+        let kind = doc["kind"] as? String
+      else {
+        NSLog("x07 ipc: %@", payload)
+        return
+      }
+
+      switch kind {
+      case "x07.device.native.request":
+        handleNativeRequest(doc, webView: webView)
+      case "x07.device.ui.ready":
+        return
+      case "x07.device.ui.error":
+        telemetry.emitNativeEvent(
+          eventClass: "runtime.error",
+          name: "bootstrap.error",
+          severity: "error",
+          attributes: [
+            "stage": "ios.ipc",
+            "message": String(describing: doc["message"] ?? "ui error"),
+          ]
+        )
+      default:
+        NSLog("x07 ipc: %@", payload)
+      }
+    }
+
+    private func handleNativeRequest(_ doc: [String: Any], webView: WKWebView) {
+      self.webView = webView
+      let bridgeRequestId = String(describing: doc["bridge_request_id"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !bridgeRequestId.isEmpty else {
+        return
+      }
+      let request = doc["request"] as? [String: Any] ?? [:]
+      let family = String(describing: request["family"] ?? "")
+      let pending = PendingNativeRequest(bridgeRequestId: bridgeRequestId, request: request, startedAt: Date())
+      let capability = String(describing: request["capability"] ?? "")
+      if !capability.isEmpty, !capabilities.allows(capability) {
+        completeRequest(pending, webView: webView, status: "unsupported", payload: [:], eventClass: "policy.violation", eventName: "device.capability.denied", severity: "warn")
+        return
+      }
+
+      switch family {
+      case "permissions":
+        handlePermissionsRequest(pending, webView: webView)
+      case "camera":
+        handleCameraRequest(pending, webView: webView)
+      case "files":
+        handleFilesRequest(pending, webView: webView)
+      case "blobs":
+        handleBlobsRequest(pending, webView: webView)
+      case "location":
+        handleLocationRequest(pending, webView: webView)
+      case "notifications":
+        let result = handleNotificationsRequest(request, webView: webView)
+        sendBridgeReply(bridgeRequestId, result: result, webView: webView)
+        emitRequestTelemetry(request: request, status: resultStatus(result), durationMs: Int64(Date().timeIntervalSince(pending.startedAt) * 1000))
+      default:
+        let result = nativeBridgeResult(
+          family: family,
+          request: request,
+          status: "unsupported",
+          payload: [:]
+        )
+        sendBridgeReply(bridgeRequestId, result: result, webView: webView)
+        emitRequestTelemetry(request: request, status: "unsupported", durationMs: Int64(Date().timeIntervalSince(pending.startedAt) * 1000))
+      }
+    }
+
+    private func handlePermissionsRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
+      let payload = pending.request["payload"] as? [String: Any] ?? [:]
+      let permission = String(describing: payload["permission"] ?? "")
+      let op = String(describing: pending.request["op"] ?? "")
+      if op == "permissions.query" {
+        queryPermission(permission) { [weak self, weak webView] status, state in
+          guard let self, let webView else { return }
+          self.completeRequest(
+            pending,
+            webView: webView,
+            status: status,
+            payload: [
+              "permission": permission,
+              "state": state,
+            ]
+          )
+        }
+        return
+      }
+
+      switch permission {
+      case "camera":
+        let auth = AVCaptureDevice.authorizationStatus(for: .video)
+        switch auth {
+        case .authorized:
+          completeRequest(pending, webView: webView, status: "ok", payload: ["permission": permission, "state": "granted"])
+        case .denied:
+          completeRequest(pending, webView: webView, status: "denied", payload: ["permission": permission, "state": "denied"])
+        case .restricted:
+          completeRequest(pending, webView: webView, status: "denied", payload: ["permission": permission, "state": "restricted"])
+        case .notDetermined:
+          AVCaptureDevice.requestAccess(for: .video) { [weak self, weak webView] granted in
+            DispatchQueue.main.async {
+              guard let self, let webView else { return }
+              self.completeRequest(
+                pending,
+                webView: webView,
+                status: granted ? "ok" : "denied",
+                payload: [
+                  "permission": permission,
+                  "state": granted ? "granted" : "denied",
+                ]
+              )
+            }
+          }
+        @unknown default:
+          completeRequest(pending, webView: webView, status: "unsupported", payload: ["permission": permission, "state": "unsupported"])
+        }
+      case "location_foreground":
+        let current = Self.locationState()
+        switch current {
+        case "prompt":
+          if pendingPermissionRequest != nil {
+            completeRequest(pending, webView: webView, status: "error", payload: ["message": "location permission request already in flight"])
+            return
+          }
+          pendingPermissionRequest = PendingPermissionRequest(permission: permission, request: pending)
+          locationManager.requestWhenInUseAuthorization()
+        case "granted":
+          completeRequest(pending, webView: webView, status: "ok", payload: ["permission": permission, "state": "granted"])
+        case "denied":
+          completeRequest(pending, webView: webView, status: "denied", payload: ["permission": permission, "state": "denied"])
+        case "restricted":
+          completeRequest(pending, webView: webView, status: "denied", payload: ["permission": permission, "state": "restricted"])
+        default:
+          completeRequest(pending, webView: webView, status: "unsupported", payload: ["permission": permission, "state": "unsupported"])
+        }
+      case "notifications":
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { [weak self, weak webView] granted, _ in
+          UNUserNotificationCenter.current().getNotificationSettings { settings in
+            DispatchQueue.main.async {
+              guard let self, let webView else { return }
+              let state = Self.notificationState(settings.authorizationStatus)
+              self.completeRequest(
+                pending,
+                webView: webView,
+                status: granted || state == "granted" ? "ok" : (state == "denied" ? "denied" : "unsupported"),
+                payload: [
+                  "permission": permission,
+                  "state": state,
+                ]
+              )
+            }
+          }
+        }
+      default:
+        completeRequest(pending, webView: webView, status: "unsupported", payload: ["permission": permission, "state": "unsupported"])
+      }
+    }
+
+    private func queryPermission(_ permission: String, completion: @escaping (String, String) -> Void) {
+      switch permission {
+      case "camera":
+        completion("ok", Self.cameraState())
+      case "location_foreground":
+        completion("ok", Self.locationState())
+      case "notifications":
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+          completion("ok", Self.notificationState(settings.authorizationStatus))
+        }
+      default:
+        completion("unsupported", "unsupported")
+      }
+    }
+
+    private func handleCameraRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
+      guard capabilities.allows("blob_store"), blobStore != nil else {
+        completeRequest(pending, webView: webView, status: "unsupported", payload: ["reason": "blob_store_disabled"])
+        return
+      }
+      guard pendingCameraRequest == nil else {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": "camera request already in flight"])
+        return
+      }
+      guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
+        completeRequest(pending, webView: webView, status: "unsupported", payload: [:])
+        return
+      }
+      guard let presenter = hostViewController(for: webView) else {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": "missing host view controller"])
+        return
+      }
+      let payload = pending.request["payload"] as? [String: Any] ?? [:]
+      let lens = String(describing: payload["lens"] ?? "rear")
+      let quality = String(describing: payload["quality"] ?? "medium")
+      pendingCameraCompressionQuality = Self.jpegCompressionQuality(quality)
+      pendingCameraRequest = pending
+      let picker = UIImagePickerController()
+      picker.delegate = self
+      picker.sourceType = .camera
+      picker.mediaTypes = ["public.image"]
+      if lens == "front", UIImagePickerController.isCameraDeviceAvailable(.front) {
+        picker.cameraDevice = .front
+      } else {
+        picker.cameraDevice = .rear
+      }
+      presenter.present(picker, animated: true)
+    }
+
+    private func handleFilesRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
+      guard capabilities.allows("blob_store"), blobStore != nil else {
+        completeRequest(pending, webView: webView, status: "unsupported", payload: ["reason": "blob_store_disabled"])
+        return
+      }
+      guard pendingFileRequest == nil else {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": "file picker already in flight"])
+        return
+      }
+      guard let presenter = hostViewController(for: webView) else {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": "missing host view controller"])
+        return
+      }
+      let payload = pending.request["payload"] as? [String: Any] ?? [:]
+      let accepts = (payload["accept"] as? [String]) ?? capabilities.fileAcceptDefaults()
+      pendingFileRequest = pending
+      let picker = UIDocumentPickerViewController(forOpeningContentTypes: utTypes(for: accepts), asCopy: true)
+      picker.allowsMultipleSelection = false
+      picker.delegate = self
+      presenter.present(picker, animated: true)
+    }
+
+    private func handleBlobsRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
+      guard let blobStore else {
+        completeRequest(pending, webView: webView, status: "unsupported", payload: ["reason": "blob_store_disabled"])
+        return
+      }
+      let payload = pending.request["payload"] as? [String: Any] ?? [:]
+      let handle = String(describing: payload["handle"] ?? "")
+      let op = String(describing: pending.request["op"] ?? "")
+      if op == "blobs.delete" {
+        do {
+          let blob = try blobStore.delete(handle: handle)
+          completeRequest(pending, webView: webView, status: "ok", payload: ["blob": blob.payload()])
+        } catch let error as NativeBlobStoreError {
+          completeRequest(pending, webView: webView, status: "error", payload: ["reason": error.code, "message": error.message])
+        } catch {
+          completeRequest(pending, webView: webView, status: "error", payload: ["message": error.localizedDescription])
+        }
+      } else {
+        let blob = blobStore.stat(handle: handle)
+        completeRequest(pending, webView: webView, status: "ok", payload: ["blob": blob.payload()])
+      }
+    }
+
+    private func handleLocationRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
+      guard CLLocationManager.locationServicesEnabled() else {
+        completeRequest(pending, webView: webView, status: "unsupported", payload: [:])
+        return
+      }
+      let state = Self.locationState()
+      guard state == "granted" else {
+        completeRequest(
+          pending,
+          webView: webView,
+          status: state == "prompt" ? "denied" : (state == "denied" ? "denied" : "unsupported"),
+          payload: [:]
+        )
+        return
+      }
+      guard pendingLocationRequest == nil else {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": "location request already in flight"])
+        return
+      }
+      pendingLocationRequest = pending
+      let payload = pending.request["payload"] as? [String: Any] ?? [:]
+      let timeoutMs = (payload["timeout_ms"] as? NSNumber)?.intValue ?? 10_000
+      let timeoutWork = DispatchWorkItem { [weak self, weak webView] in
+        guard let self, let webView, let pending = self.pendingLocationRequest else { return }
+        self.pendingLocationRequest = nil
+        self.pendingLocationTimeout = nil
+        self.completeRequest(pending, webView: webView, status: "timeout", payload: [:])
+      }
+      pendingLocationTimeout = timeoutWork
+      DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(timeoutMs, 0)), execute: timeoutWork)
+      locationManager.requestLocation()
+    }
+
+    private func handleNotificationsRequest(_ request: [String: Any], webView: WKWebView) -> [String: Any] {
+      let payload = request["payload"] as? [String: Any] ?? [:]
+      let notificationId = String(
+        describing: payload["notification_id"] ?? payload["id"] ?? request["request_id"] ?? ""
+      ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+      if String(describing: request["op"] ?? "") == "notifications.cancel" {
+        notificationTasks[notificationId]?.cancel()
+        notificationTasks.removeValue(forKey: notificationId)
+        return nativeBridgeResult(
+          family: "notifications",
+          request: request,
+          status: "ok",
+          payload: ["notification_id": notificationId]
+        )
+      }
+
+      let delayMs = (payload["delay_ms"] as? NSNumber)?.intValue ?? 0
+      notificationTasks[notificationId]?.cancel()
+      let workItem = DispatchWorkItem { [weak self, weak webView] in
+        guard let self, let webView else {
+          return
+        }
+        self.telemetry.emitNativeEvent(
+          eventClass: "app.lifecycle",
+          name: "notification.opened",
+          severity: "info",
+          attributes: [
+            "notification_id": notificationId,
+          ]
+        )
+        self.evaluateBridgeHook(
+          "__x07DispatchDeviceEvent",
+          payload: [
+            "type": "notification.opened",
+            "notification_id": notificationId,
+          ],
+          webView: webView
+        )
+      }
+      notificationTasks[notificationId] = workItem
+      DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(delayMs, 0)), execute: workItem)
+      return nativeBridgeResult(
+        family: "notifications",
+        request: request,
+        status: "ok",
+        payload: ["notification_id": notificationId]
+      )
+    }
+
+    private func nativeBridgeResult(
+      family: String,
+      request: [String: Any],
+      status: String,
+      payload: [String: Any]
+    ) -> [String: Any] {
+      [
+        "family": family,
+        "result": [
+          "request_id": String(describing: request["request_id"] ?? ""),
+          "op": String(describing: request["op"] ?? ""),
+          "capability": String(describing: request["capability"] ?? ""),
+          "status": status,
+          "payload": payload,
+          "host_meta": [
+            "platform": "ios",
+            "provider": "ios_native",
+          ],
+        ],
+      ]
+    }
+
+    private func resultStatus(_ result: [String: Any]) -> String {
+      ((result["result"] as? [String: Any])?["status"] as? String) ?? "error"
+    }
+
+    private func sendBridgeReply(_ bridgeRequestId: String, result: [String: Any], webView: WKWebView) {
+      evaluateBridgeHook(
+        "__x07ReceiveDeviceReply",
+        payload: [
+          "bridge_request_id": bridgeRequestId,
+          "result": result,
+        ],
+        webView: webView
+      )
+    }
+
+    private func completeRequest(
+      _ pending: PendingNativeRequest,
+      webView: WKWebView,
+      status: String,
+      payload: [String: Any],
+      eventClass: String? = nil,
+      eventName: String? = nil,
+      severity: String? = nil
+    ) {
+      let family = String(describing: pending.request["family"] ?? "")
+      let result = nativeBridgeResult(family: family, request: pending.request, status: status, payload: payload)
+      sendBridgeReply(pending.bridgeRequestId, result: result, webView: webView)
+      emitRequestTelemetry(
+        request: pending.request,
+        status: status,
+        durationMs: Int64(Date().timeIntervalSince(pending.startedAt) * 1000),
+        eventClass: eventClass,
+        eventName: eventName,
+        severity: severity
+      )
+    }
+
+    private func emitRequestTelemetry(
+      request: [String: Any],
+      status: String,
+      durationMs: Int64,
+      eventClass: String? = nil,
+      eventName: String? = nil,
+      severity: String? = nil
+    ) {
+      telemetry.emitNativeEvent(
+        eventClass: eventClass ?? (status == "error" ? "runtime.error" : "bridge.timing"),
+        name: eventName ?? (status == "error" ? "device.op.error" : "device.op.result"),
+        severity: severity ?? (status == "error" ? "error" : "info"),
+        attributes: [
+          "x07.device.op": String(describing: request["op"] ?? ""),
+          "x07.device.request_id": String(describing: request["request_id"] ?? ""),
+          "x07.device.status": status,
+          "x07.device.capability": String(describing: request["capability"] ?? ""),
+          "x07.device.platform": "ios",
+          "x07.device.duration_ms": durationMs,
+        ]
+      )
+    }
+
+    private func evaluateBridgeHook(_ hookName: String, payload: [String: Any], webView: WKWebView) {
+      guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+        return
+      }
+      let json = String(decoding: data, as: UTF8.self)
+      webView.evaluateJavaScript("globalThis.\(hookName)?.(\(json));")
+    }
+
+    private static func cameraState() -> String {
+      switch AVCaptureDevice.authorizationStatus(for: .video) {
+      case .authorized:
+        return "granted"
+      case .denied:
+        return "denied"
+      case .restricted:
+        return "restricted"
+      case .notDetermined:
+        return "prompt"
+      @unknown default:
+        return "unsupported"
+      }
+    }
+
+    private static func locationState() -> String {
+      switch CLLocationManager().authorizationStatus {
+      case .authorizedAlways, .authorizedWhenInUse:
+        return "granted"
+      case .denied:
+        return "denied"
+      case .restricted:
+        return "restricted"
+      case .notDetermined:
+        return "prompt"
+      @unknown default:
+        return "unsupported"
+      }
+    }
+
+    private static func notificationState(_ status: UNAuthorizationStatus) -> String {
+      switch status {
+      case .authorized, .provisional, .ephemeral:
+        return "granted"
+      case .denied:
+        return "denied"
+      case .notDetermined:
+        return "prompt"
+      @unknown default:
+        return "unsupported"
+      }
+    }
+
+    private static func jpegCompressionQuality(_ quality: String) -> CGFloat {
+      switch quality {
+      case "low":
+        return 0.5
+      case "high":
+        return 0.92
+      default:
+        return 0.75
+      }
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+      _ = manager
+      guard let pendingPermissionRequest, pendingPermissionRequest.permission == "location_foreground", let webView else {
+        return
+      }
+      let state = Self.locationState()
+      guard state != "prompt" else {
+        return
+      }
+      self.pendingPermissionRequest = nil
+      let status = state == "granted" ? "ok" : (state == "denied" || state == "restricted" ? "denied" : "unsupported")
+      completeRequest(
+        pendingPermissionRequest.request,
+        webView: webView,
+        status: status,
+        payload: [
+          "permission": pendingPermissionRequest.permission,
+          "state": state,
+        ]
+      )
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+      _ = manager
+      guard let pending = pendingLocationRequest, let webView, let location = locations.last else {
+        return
+      }
+      pendingLocationTimeout?.cancel()
+      pendingLocationTimeout = nil
+      pendingLocationRequest = nil
+      var payload: [String: Any] = [
+        "latitude": location.coordinate.latitude,
+        "longitude": location.coordinate.longitude,
+        "accuracy_m": location.horizontalAccuracy,
+        "captured_at_ms": unixTimeMs(),
+      ]
+      if location.verticalAccuracy >= 0 {
+        payload["altitude_m"] = location.altitude
+      }
+      completeRequest(pending, webView: webView, status: "ok", payload: payload)
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+      _ = manager
+      guard let pending = pendingLocationRequest, let webView else {
+        return
+      }
+      pendingLocationTimeout?.cancel()
+      pendingLocationTimeout = nil
+      pendingLocationRequest = nil
+      let status = (error as? CLError)?.code == .denied ? "denied" : "error"
+      completeRequest(
+        pending,
+        webView: webView,
+        status: status,
+        payload: status == "error" ? ["message": error.localizedDescription] : [:]
+      )
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+      controller.dismiss(animated: true)
+      guard let pending = pendingFileRequest, let webView else {
+        return
+      }
+      pendingFileRequest = nil
+      completeRequest(pending, webView: webView, status: "cancelled", payload: [:])
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+      controller.dismiss(animated: true)
+      guard let pending = pendingFileRequest, let webView else {
+        return
+      }
+      pendingFileRequest = nil
+      guard let url = urls.first else {
+        completeRequest(pending, webView: webView, status: "cancelled", payload: [:])
+        return
+      }
+      let accessed = url.startAccessingSecurityScopedResource()
+      defer {
+        if accessed {
+          url.stopAccessingSecurityScopedResource()
+        }
+      }
+      do {
+        guard let blobStore else {
+          completeRequest(pending, webView: webView, status: "unsupported", payload: ["reason": "blob_store_disabled"])
+          return
+        }
+        let data = try Data(contentsOf: url)
+        let manifest = try blobStore.put(data: data, mime: mimeType(for: url), source: "files")
+        completeRequest(pending, webView: webView, status: "ok", payload: ["blobs": [manifest.payload()]])
+      } catch let error as NativeBlobStoreError {
+        completeRequest(pending, webView: webView, status: "error", payload: ["reason": error.code, "message": error.message])
+      } catch {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": error.localizedDescription])
+      }
+    }
+
+    func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+      picker.dismiss(animated: true)
+      guard let pending = pendingCameraRequest, let webView else {
+        return
+      }
+      pendingCameraRequest = nil
+      completeRequest(pending, webView: webView, status: "cancelled", payload: [:])
+    }
+
+    func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+      picker.dismiss(animated: true)
+      guard let pending = pendingCameraRequest, let webView else {
+        return
+      }
+      pendingCameraRequest = nil
+      guard
+        let blobStore,
+        let image = info[.originalImage] as? UIImage,
+        let data = image.jpegData(compressionQuality: pendingCameraCompressionQuality)
+      else {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": "camera capture failed"])
+        return
+      }
+      do {
+        let manifest = try blobStore.put(data: data, mime: "image/jpeg", source: "camera")
+        completeRequest(
+          pending,
+          webView: webView,
+          status: "ok",
+          payload: [
+            "blob": manifest.payload(),
+            "image": [
+              "width": Int(image.size.width.rounded()),
+              "height": Int(image.size.height.rounded()),
+            ],
+          ]
+        )
+      } catch let error as NativeBlobStoreError {
+        completeRequest(pending, webView: webView, status: "error", payload: ["reason": error.code, "message": error.message])
+      } catch {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": error.localizedDescription])
       }
     }
 

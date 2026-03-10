@@ -1,6 +1,6 @@
 [package]
 name = "x07-device-host-assets"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Pinned host assets for X07 device hosts."

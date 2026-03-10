@@ -29,7 +29,13 @@ token_targets = [
     (
         "ios",
         root / "mobile" / "ios" / "template",
-        ["__X07_DISPLAY_NAME__", "__X07_IOS_BUNDLE_ID__", "__X07_VERSION__", "__X07_BUILD__"],
+        [
+            "__X07_DISPLAY_NAME__",
+            "__X07_IOS_BUNDLE_ID__",
+            "__X07_VERSION__",
+            "__X07_BUILD__",
+            "__X07_IOS_USAGE_STRINGS__",
+        ],
     ),
     (
         "android",
@@ -40,6 +46,7 @@ token_targets = [
             "__X07_ANDROID_MIN_SDK__",
             "__X07_VERSION__",
             "__X07_BUILD__",
+            "__X07_ANDROID_RUNTIME_PERMISSIONS__",
         ],
     ),
 ]

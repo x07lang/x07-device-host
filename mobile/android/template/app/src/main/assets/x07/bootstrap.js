@@ -83,6 +83,9 @@ async function main() {
     bundleManifest,
     deviceProfile,
   });
+  if (hasIpc()) {
+    globalThis.__x07DeviceNativeBridge = "m0";
+  }
   telemetry.configure();
   installLifecycleTelemetry(telemetry);
   telemetry.emit("app.lifecycle", "app.start", {

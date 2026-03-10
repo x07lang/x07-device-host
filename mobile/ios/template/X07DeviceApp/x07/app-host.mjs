@@ -687,6 +687,11 @@ export const __x07_host_private = {
   render,
   snapshotFocusedControl,
   restoreFocusedControl,
+  parseAnyDeviceEffect,
+  normalizeDeviceResult,
+  normalizeDeviceHostEvent,
+  capabilityAllowed,
+  mkDeviceResult,
 };
 
 function setAttrs(el, tag, attrs) {
@@ -1100,6 +1105,651 @@ function parseTimerClearEffect(effect) {
   return { id };
 }
 
+const DEVICE_RESULT_STATUSES = new Set([
+  "ok",
+  "denied",
+  "cancelled",
+  "unsupported",
+  "timeout",
+  "error",
+]);
+
+function bytesToHex(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  let out = "";
+  for (const b of u8) out += b.toString(16).padStart(2, "0");
+  return out;
+}
+
+async function sha256Hex(bytes) {
+  if (!globalThis.crypto?.subtle) throw new Error("crypto.subtle is unavailable");
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", u8);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+function parseJsonMaybe(raw) {
+  if (typeof raw === "string") return JSON.parse(raw);
+  return raw;
+}
+
+function deviceHostMeta(platform) {
+  return {
+    platform: String(platform || "unknown"),
+    host_mode:
+      Boolean(globalThis.ipc && typeof globalThis.ipc.postMessage === "function") ? "device" : "web",
+  };
+}
+
+function mapPermissionToCapability(permission) {
+  switch (String(permission || "")) {
+    case "camera":
+      return "camera.photo";
+    case "location_foreground":
+      return "location.foreground";
+    case "notifications":
+      return "notifications.local";
+    default:
+      return "";
+  }
+}
+
+function capabilityAllowed(capabilities, capability) {
+  const device = capabilities?.device;
+  switch (String(capability || "")) {
+    case "camera.photo":
+      return device?.camera?.photo === true;
+    case "files.pick":
+      return device?.files?.pick === true;
+    case "blob_store":
+      return device?.blob_store?.enabled === true;
+    case "location.foreground":
+      return device?.location?.foreground === true;
+    case "notifications.local":
+      return device?.notifications?.local === true;
+    default:
+      return false;
+  }
+}
+
+function blobQuotaConfig(capabilities) {
+  const cfg = capabilities?.device?.blob_store;
+  return {
+    maxTotalBytes: Number(cfg?.max_total_bytes ?? 64 * 1024 * 1024),
+    maxItemBytes: Number(cfg?.max_item_bytes ?? 16 * 1024 * 1024),
+  };
+}
+
+function mkDeviceResult(request, status, payload = {}, hostMeta = {}) {
+  const nextStatus = DEVICE_RESULT_STATUSES.has(String(status || "")) ? String(status) : "error";
+  return {
+    request_id: String(request?.request_id ?? ""),
+    op: String(request?.op ?? ""),
+    capability: String(request?.capability ?? ""),
+    status: nextStatus,
+    payload: payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {},
+    host_meta: hostMeta && typeof hostMeta === "object" ? hostMeta : {},
+  };
+}
+
+function normalizeDeviceResult(request, raw, family, platform) {
+  const doc = raw && typeof raw === "object" ? raw : {};
+  const payload = doc.payload && typeof doc.payload === "object" && !Array.isArray(doc.payload) ? doc.payload : {};
+  return {
+    family: String(doc.family || family || request?.family || ""),
+    result: mkDeviceResult(request, doc.status, payload, {
+      ...deviceHostMeta(platform),
+      ...(doc.host_meta && typeof doc.host_meta === "object" ? doc.host_meta : {}),
+    }),
+  };
+}
+
+function buildMissingBlobManifest(handle, source = "blob_store") {
+  return {
+    handle: String(handle || ""),
+    sha256: "",
+    mime: "application/octet-stream",
+    byte_size: 0,
+    created_at_ms: 0,
+    source: String(source || "blob_store"),
+    local_state: "missing",
+  };
+}
+
+function normalizePermissionState(raw) {
+  switch (String(raw || "")) {
+    case "granted":
+      return "granted";
+    case "denied":
+      return "denied";
+    case "prompt":
+    case "default":
+      return "prompt";
+    case "restricted":
+      return "restricted";
+    default:
+      return "unsupported";
+  }
+}
+
+function normalizeDeviceHostEvent(raw) {
+  const doc = raw && typeof raw === "object" ? raw : {};
+  const type = String(doc.type ?? "");
+  if (!type) throw new Error("device host event missing type");
+  return { ...doc, type };
+}
+
+function parseCommonDeviceRequest(effect, expectedKind, family, expectedOp, fallbackCapability = "") {
+  if (!effect || typeof effect !== "object") return null;
+  if (effect.v !== 1 || effect.kind !== expectedKind) return null;
+  const requestId = effect.request_id;
+  const op = typeof effect.op === "string" && effect.op ? effect.op : expectedOp;
+  const capability =
+    typeof effect.capability === "string" && effect.capability
+      ? effect.capability
+      : fallbackCapability;
+  const payload = effect.payload && typeof effect.payload === "object" && !Array.isArray(effect.payload)
+    ? effect.payload
+    : {};
+  if (typeof requestId !== "string" || !requestId) {
+    throw new Error(`invalid ${expectedKind} request_id`);
+  }
+  if (op !== expectedOp) {
+    throw new Error(`invalid ${expectedKind} op`);
+  }
+  if (typeof capability !== "string" || !capability) {
+    throw new Error(`invalid ${expectedKind} capability`);
+  }
+  return { family, kind: expectedKind, request_id: requestId, op, capability, payload };
+}
+
+function parseDevicePermissionsEffect(effect) {
+  const query = parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.permissions.query",
+    "permissions",
+    "permissions.query",
+    "",
+  );
+  if (query) {
+    const permission = typeof query.payload.permission === "string" ? query.payload.permission : query.capability;
+    if (!permission) throw new Error("permissions.query missing payload.permission");
+    query.capability = mapPermissionToCapability(permission);
+    query.payload = { permission };
+    return query;
+  }
+  const request = parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.permissions.request",
+    "permissions",
+    "permissions.request",
+    "",
+  );
+  if (!request) return null;
+  const permission = typeof request.payload.permission === "string" ? request.payload.permission : request.capability;
+  if (!permission) throw new Error("permissions.request missing payload.permission");
+  request.capability = mapPermissionToCapability(permission);
+  request.payload = { permission };
+  return request;
+}
+
+function parseDeviceCameraEffect(effect) {
+  return parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.camera.capture",
+    "camera",
+    "camera.capture",
+    "camera.photo",
+  );
+}
+
+function parseDeviceFilesEffect(effect) {
+  return parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.files.pick",
+    "files",
+    "files.pick",
+    "files.pick",
+  );
+}
+
+function parseDeviceBlobsStatEffect(effect) {
+  return parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.blobs.stat",
+    "blobs",
+    "blobs.stat",
+    "blob_store",
+  );
+}
+
+function parseDeviceBlobsDeleteEffect(effect) {
+  return parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.blobs.delete",
+    "blobs",
+    "blobs.delete",
+    "blob_store",
+  );
+}
+
+function parseDeviceLocationEffect(effect) {
+  return parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.location.get_current",
+    "location",
+    "location.get_current",
+    "location.foreground",
+  );
+}
+
+function parseDeviceNotificationsScheduleEffect(effect) {
+  return parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.notifications.schedule",
+    "notifications",
+    "notifications.schedule",
+    "notifications.local",
+  );
+}
+
+function parseDeviceNotificationsCancelEffect(effect) {
+  return parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.notifications.cancel",
+    "notifications",
+    "notifications.cancel",
+    "notifications.local",
+  );
+}
+
+function parseAnyDeviceEffect(effect) {
+  return (
+    parseDevicePermissionsEffect(effect) ||
+    parseDeviceCameraEffect(effect) ||
+    parseDeviceFilesEffect(effect) ||
+    parseDeviceBlobsStatEffect(effect) ||
+    parseDeviceBlobsDeleteEffect(effect) ||
+    parseDeviceLocationEffect(effect) ||
+    parseDeviceNotificationsScheduleEffect(effect) ||
+    parseDeviceNotificationsCancelEffect(effect)
+  );
+}
+
+function mergeShallowObject(base, patch) {
+  if (base && typeof base === "object" && !Array.isArray(base)) {
+    return { ...base, ...patch };
+  }
+  return { ...patch };
+}
+
+function createInMemoryBlobStore(capabilities) {
+  const items = new Map();
+  const quotas = blobQuotaConfig(capabilities);
+  let totalBytes = 0;
+
+  return {
+    async put(bytes, { mime = "application/octet-stream", source = "files", image = null } = {}) {
+      const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+      if (u8.length > quotas.maxItemBytes) {
+        const err = new Error("blob item exceeds max_item_bytes");
+        err.code = "blob_item_too_large";
+        throw err;
+      }
+      const sha256 = await sha256Hex(u8);
+      const handle = `blob:sha256:${sha256}`;
+      if (items.has(handle)) {
+        return items.get(handle).manifest;
+      }
+      if (totalBytes + u8.length > quotas.maxTotalBytes) {
+        const err = new Error("blob store exceeds max_total_bytes");
+        err.code = "blob_total_too_large";
+        throw err;
+      }
+      const manifest = {
+        handle,
+        sha256,
+        mime: String(mime || "application/octet-stream"),
+        byte_size: u8.length,
+        created_at_ms: Date.now(),
+        source: String(source || "files"),
+        local_state: "present",
+      };
+      items.set(handle, { manifest, bytes: u8, image });
+      totalBytes += u8.length;
+      return manifest;
+    },
+    stat(handle) {
+      const item = items.get(String(handle || ""));
+      return item ? item.manifest : buildMissingBlobManifest(handle);
+    },
+    delete(handle) {
+      const key = String(handle || "");
+      const item = items.get(key);
+      if (!item) {
+        return { ...buildMissingBlobManifest(handle), local_state: "missing" };
+      }
+      items.delete(key);
+      totalBytes -= item.bytes.length;
+      return { ...item.manifest, local_state: "deleted" };
+    },
+  };
+}
+
+async function readFileBytes(file) {
+  if (!file || typeof file.arrayBuffer !== "function") throw new Error("file.arrayBuffer unavailable");
+  return new Uint8Array(await file.arrayBuffer());
+}
+
+function promptBrowserFile({ accept = "", capture = "" } = {}) {
+  if (!globalThis.document?.createElement) return Promise.resolve({ status: "unsupported", file: null });
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    if (accept) input.setAttribute("accept", accept);
+    if (capture) input.setAttribute("capture", capture);
+    input.style.display = "none";
+    document.body?.appendChild?.(input);
+    let settled = false;
+    const cleanup = () => {
+      input.remove?.();
+      globalThis.removeEventListener?.("focus", onFocus, true);
+    };
+    const finish = (status, file = null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ status, file });
+    };
+    const onFocus = () => {
+      globalThis.setTimeout?.(() => finish("cancelled", null), 0);
+    };
+    input.addEventListener("change", () => {
+      const file = input.files?.[0] ?? null;
+      finish(file ? "ok" : "cancelled", file);
+    });
+    globalThis.addEventListener?.("focus", onFocus, true);
+    input.click();
+  });
+}
+
+async function queryBrowserPermissionState(permission) {
+  const name = String(permission || "");
+  if (name === "notifications") {
+    if (!globalThis.Notification) return "unsupported";
+    return normalizePermissionState(globalThis.Notification.permission);
+  }
+  const permissionsApi = globalThis.navigator?.permissions;
+  if (!permissionsApi || typeof permissionsApi.query !== "function") return "unsupported";
+  const descriptorName = name === "location_foreground" ? "geolocation" : name;
+  try {
+    const result = await permissionsApi.query({ name: descriptorName });
+    return normalizePermissionState(result?.state);
+  } catch (_) {
+    return "unsupported";
+  }
+}
+
+async function requestBrowserPermission(permission) {
+  const name = String(permission || "");
+  if (name === "notifications") {
+    if (!globalThis.Notification?.requestPermission) return { status: "unsupported", state: "unsupported" };
+    const state = normalizePermissionState(await globalThis.Notification.requestPermission());
+    return { status: "ok", state };
+  }
+  if (name === "camera") {
+    if (!globalThis.navigator?.mediaDevices?.getUserMedia) {
+      return { status: "unsupported", state: "unsupported" };
+    }
+    try {
+      const stream = await globalThis.navigator.mediaDevices.getUserMedia({ video: true });
+      stream.getTracks?.().forEach((track) => track.stop?.());
+      return { status: "ok", state: "granted" };
+    } catch (err) {
+      const errName = String(err?.name ?? "");
+      if (errName === "NotAllowedError" || errName === "SecurityError") {
+        return { status: "denied", state: "denied" };
+      }
+      return { status: "error", state: "unsupported" };
+    }
+  }
+  if (name === "location_foreground") {
+    if (!globalThis.navigator?.geolocation?.getCurrentPosition) {
+      return { status: "unsupported", state: "unsupported" };
+    }
+    return new Promise((resolve) => {
+      globalThis.navigator.geolocation.getCurrentPosition(
+        () => resolve({ status: "ok", state: "granted" }),
+        (err) => {
+          const code = Number(err?.code ?? 0);
+          if (code === 1) resolve({ status: "denied", state: "denied" });
+          else if (code === 3) resolve({ status: "timeout", state: "prompt" });
+          else resolve({ status: "error", state: "unsupported" });
+        },
+        { maximumAge: 0, timeout: 10000, enableHighAccuracy: false },
+      );
+    });
+  }
+  return { status: "unsupported", state: "unsupported" };
+}
+
+function getCurrentBrowserLocation(timeoutMs) {
+  if (!globalThis.navigator?.geolocation?.getCurrentPosition) {
+    return Promise.resolve({ status: "unsupported", payload: {} });
+  }
+  return new Promise((resolve) => {
+    globalThis.navigator.geolocation.getCurrentPosition(
+      (pos) =>
+        resolve({
+          status: "ok",
+          payload: {
+            latitude: Number(pos?.coords?.latitude ?? 0),
+            longitude: Number(pos?.coords?.longitude ?? 0),
+            accuracy_m: Number(pos?.coords?.accuracy ?? 0),
+            altitude_m:
+              Number.isFinite(Number(pos?.coords?.altitude))
+                ? Number(pos.coords.altitude)
+                : null,
+            captured_at_ms: Date.now(),
+          },
+        }),
+      (err) => {
+        const code = Number(err?.code ?? 0);
+        if (code === 1) resolve({ status: "denied", payload: {} });
+        else if (code === 3) resolve({ status: "timeout", payload: {} });
+        else resolve({ status: "error", payload: {} });
+      },
+      {
+        maximumAge: 0,
+        timeout: Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Math.floor(Number(timeoutMs)) : 10000,
+        enableHighAccuracy: false,
+      },
+    );
+  });
+}
+
+function createBrowserNativeHost({ capabilities, dispatchHostEvent, platform = "web" }) {
+  const blobStore = createInMemoryBlobStore(capabilities);
+  const notifications = new Map();
+
+  function clearNotification(id) {
+    const entry = notifications.get(String(id || ""));
+    if (!entry) return null;
+    if (entry.timeoutHandle) clearTimeout(entry.timeoutHandle);
+    entry.notification?.close?.();
+    notifications.delete(String(id || ""));
+    return entry;
+  }
+
+  return {
+    mode: "browser",
+    async invoke(request) {
+      const hostMeta = deviceHostMeta(platform);
+      switch (request.family) {
+        case "permissions": {
+          const permission = String(request.payload.permission || "");
+          if (request.op === "permissions.query") {
+            const state = await queryBrowserPermissionState(permission);
+            return { family: request.family, result: mkDeviceResult(request, "ok", { permission, state }, hostMeta) };
+          }
+          const outcome = await requestBrowserPermission(permission);
+          return {
+            family: request.family,
+            result: mkDeviceResult(request, outcome.status, { permission, state: outcome.state }, hostMeta),
+          };
+        }
+        case "camera": {
+          const lens = String(request.payload.lens || "rear");
+          const pick = await promptBrowserFile({
+            accept: "image/*",
+            capture: lens === "front" ? "user" : "environment",
+          });
+          if (pick.status !== "ok" || !pick.file) {
+            return { family: request.family, result: mkDeviceResult(request, pick.status, {}, hostMeta) };
+          }
+          const bytes = await readFileBytes(pick.file);
+          const manifest = await blobStore.put(bytes, {
+            mime: pick.file.type || "image/jpeg",
+            source: "camera",
+            image: null,
+          });
+          return {
+            family: request.family,
+            result: mkDeviceResult(
+              request,
+              "ok",
+              {
+                blob: manifest,
+                image: { width: 0, height: 0 },
+              },
+              hostMeta,
+            ),
+          };
+        }
+        case "files": {
+          const accept = Array.isArray(request.payload.accept)
+            ? request.payload.accept.map((item) => String(item || "")).filter(Boolean).join(",")
+            : "";
+          const pick = await promptBrowserFile({ accept });
+          if (pick.status !== "ok" || !pick.file) {
+            return { family: request.family, result: mkDeviceResult(request, pick.status, {}, hostMeta) };
+          }
+          const bytes = await readFileBytes(pick.file);
+          const manifest = await blobStore.put(bytes, {
+            mime: pick.file.type || "application/octet-stream",
+            source: "files",
+          });
+          return {
+            family: request.family,
+            result: mkDeviceResult(request, "ok", { blobs: [manifest] }, hostMeta),
+          };
+        }
+        case "blobs": {
+          const handle = String(request.payload.handle || "");
+          if (request.op === "blobs.delete") {
+            return {
+              family: request.family,
+              result: mkDeviceResult(request, "ok", { blob: blobStore.delete(handle) }, hostMeta),
+            };
+          }
+          return {
+            family: request.family,
+            result: mkDeviceResult(request, "ok", { blob: blobStore.stat(handle) }, hostMeta),
+          };
+        }
+        case "location": {
+          const outcome = await getCurrentBrowserLocation(request.payload.timeout_ms);
+          return {
+            family: request.family,
+            result: mkDeviceResult(request, outcome.status, outcome.payload, hostMeta),
+          };
+        }
+        case "notifications": {
+          if (!globalThis.Notification) {
+            return { family: request.family, result: mkDeviceResult(request, "unsupported", {}, hostMeta) };
+          }
+          if (request.op === "notifications.cancel") {
+            const notificationId = String(request.payload.notification_id || request.payload.id || "");
+            clearNotification(notificationId);
+            return {
+              family: request.family,
+              result: mkDeviceResult(request, "ok", { notification_id: notificationId }, hostMeta),
+            };
+          }
+          const permission = normalizePermissionState(globalThis.Notification.permission);
+          if (permission !== "granted") {
+            return {
+              family: request.family,
+              result: mkDeviceResult(request, permission === "denied" ? "denied" : "unsupported", {}, hostMeta),
+            };
+          }
+          const notificationId = String(request.payload.notification_id || request.payload.id || request.request_id || "");
+          const title = String(request.payload.title || "");
+          const body = String(request.payload.body || "");
+          const delayMs = Number.isFinite(Number(request.payload.delay_ms))
+            ? Math.max(0, Math.floor(Number(request.payload.delay_ms)))
+            : 0;
+          const timeoutHandle = globalThis.setTimeout?.(() => {
+            const notification = new globalThis.Notification(title, { body, tag: notificationId });
+            notification.onclick = () => {
+              void dispatchHostEvent({ type: "notification.opened", notification_id: notificationId });
+            };
+            notifications.set(notificationId, { notification, timeoutHandle: null });
+          }, delayMs);
+          notifications.set(notificationId, { timeoutHandle, notification: null });
+          return {
+            family: request.family,
+            result: mkDeviceResult(request, "ok", { notification_id: notificationId }, hostMeta),
+          };
+        }
+        default:
+          return { family: request.family, result: mkDeviceResult(request, "unsupported", {}, hostMeta) };
+      }
+    },
+  };
+}
+
+function createIpcNativeHost({ dispatchHostEvent }) {
+  if (!globalThis.ipc || typeof globalThis.ipc.postMessage !== "function") return null;
+  if (globalThis.__x07DeviceNativeBridge !== "m0") return null;
+  let seq = 0;
+  const pending = new Map();
+  globalThis.__x07ReceiveDeviceReply = (raw) => {
+    const doc = parseJsonMaybe(raw);
+    const bridgeRequestId = String(doc?.bridge_request_id ?? "");
+    if (!bridgeRequestId || !pending.has(bridgeRequestId)) return;
+    const pendingEntry = pending.get(bridgeRequestId);
+    pending.delete(bridgeRequestId);
+    pendingEntry.resolve(doc?.result ?? {});
+  };
+  globalThis.__x07DispatchDeviceEvent = (raw) => {
+    const event = normalizeDeviceHostEvent(parseJsonMaybe(raw));
+    void dispatchHostEvent(event);
+  };
+  return {
+    mode: "ipc",
+    invoke(request) {
+      return new Promise((resolve, reject) => {
+        const bridgeRequestId = `native_${seq++}`;
+        pending.set(bridgeRequestId, { resolve, reject });
+        try {
+          globalThis.ipc.postMessage(
+            JSON.stringify({
+              v: 1,
+              kind: "x07.device.native.request",
+              bridge_request_id: bridgeRequestId,
+              request,
+            }),
+          );
+        } catch (err) {
+          pending.delete(bridgeRequestId);
+          reject(err);
+        }
+      });
+    },
+  };
+}
+
 export async function mountWebUiApp({
   wasmUrl,
   componentEsmUrl,
@@ -1130,6 +1780,18 @@ export async function mountWebUiApp({
     );
     console.error(err);
   }
+
+  async function dispatchHostEvent(rawEvent) {
+    const event = normalizeDeviceHostEvent(rawEvent);
+    return dispatch(event);
+  }
+
+  const ipcNativeHost = createIpcNativeHost({ dispatchHostEvent });
+  const browserNativeHost = createBrowserNativeHost({
+    capabilities,
+    dispatchHostEvent,
+    platform: ipcNativeHost ? "device" : "web",
+  });
 
   const trace = {
     v: 1,
@@ -1197,6 +1859,7 @@ export async function mountWebUiApp({
   let state = null;
   let ui = null;
   let allowedEvents = new Map();
+  let deviceEventSourcesInstalled = false;
 
   function commitFrame(frame) {
     const nextState = frame?.state ?? null;
@@ -1272,6 +1935,7 @@ export async function mountWebUiApp({
     let frame = firstFrame;
     let uiMs = uiWallMs0;
     let httpMs = 0;
+    let nativeMs = 0;
     let loopCount = 0;
     let effectCount = 0;
     const exchanges = [];
@@ -1471,6 +2135,75 @@ export async function mountWebUiApp({
           continue;
         }
 
+        const deviceRequest = parseAnyDeviceEffect(eff);
+        if (deviceRequest) {
+          let normalized = null;
+          const platform = ipcNativeHost ? "device" : "web";
+          if (!capabilityAllowed(capabilities, deviceRequest.capability)) {
+            emitTelemetry(
+              "policy.violation",
+              "policy.device.denied",
+              {
+                family: deviceRequest.family,
+                op: deviceRequest.op,
+                capability: deviceRequest.capability,
+                request_id: deviceRequest.request_id,
+              },
+              { severity: "warn" },
+            );
+            normalized = {
+              family: deviceRequest.family,
+              result: mkDeviceResult(deviceRequest, "unsupported", {}, deviceHostMeta(platform)),
+            };
+          } else {
+            const startedNative = performance.now();
+            try {
+              const primaryHost = ipcNativeHost || browserNativeHost;
+              if (!primaryHost) throw new Error("missing native host");
+              const rawResult = await primaryHost.invoke(deviceRequest);
+              normalized = normalizeDeviceResult(deviceRequest, rawResult?.result ?? rawResult, rawResult?.family ?? deviceRequest.family, platform);
+              if (
+                ipcNativeHost &&
+                browserNativeHost &&
+                normalized.result.status === "unsupported"
+              ) {
+                const fallbackRawResult = await browserNativeHost.invoke(deviceRequest);
+                normalized = normalizeDeviceResult(
+                  deviceRequest,
+                  fallbackRawResult?.result ?? fallbackRawResult,
+                  fallbackRawResult?.family ?? deviceRequest.family,
+                  platform,
+                );
+              }
+            } catch (err) {
+              normalized = {
+                family: deviceRequest.family,
+                result: mkDeviceResult(
+                  deviceRequest,
+                  "error",
+                  { message: String(err?.message ?? err) },
+                  deviceHostMeta(platform),
+                ),
+              };
+            }
+            nativeMs += performance.now() - startedNative;
+          }
+          const inj = { [normalized.family]: { result: normalized.result } };
+          const prev = injectedState.__x07_device;
+          injectedState.__x07_device =
+            prev && typeof prev === "object" && !Array.isArray(prev) ? { ...prev, ...inj } : inj;
+          addInjectionDelta(delta, "__x07_device", inj);
+          recordEffectExchange(eff, { __x07_device: inj });
+          emitTelemetry("bridge.timing", "bridge.device_effect", {
+            family: deviceRequest.family,
+            op: deviceRequest.op,
+            request_id: deviceRequest.request_id,
+            status: normalized.result.status,
+            native_ms: Math.round(nativeMs),
+          });
+          continue;
+        }
+
         throw new Error(`unsupported effect: ${stableJson(eff)}`);
       }
 
@@ -1505,7 +2238,8 @@ export async function mountWebUiApp({
       http_exchange_count: exchanges.length,
       ui_ms: Math.round(uiMs),
       http_ms: Math.round(httpMs),
-      total_ms: Math.round(uiMs + httpMs),
+      native_ms: Math.round(nativeMs),
+      total_ms: Math.round(uiMs + httpMs + nativeMs),
     });
 
     return frame;
@@ -1518,12 +2252,47 @@ export async function mountWebUiApp({
     return runEffectsLoop(event, env0, out.frame, out.wallMs);
   }
 
+  function installDeviceEventSources() {
+    if (deviceEventSourcesInstalled) return;
+    deviceEventSourcesInstalled = true;
+    let lastVisibility = String(globalThis.document?.visibilityState ?? "visible");
+    globalThis.addEventListener?.("visibilitychange", () => {
+      const nextVisibility = String(globalThis.document?.visibilityState ?? "visible");
+      if (nextVisibility === "hidden") {
+        void dispatchHostEvent({ type: "lifecycle.background" }).catch((err) =>
+          reportDispatchError("lifecycle.background", err),
+        );
+      } else {
+        void dispatchHostEvent({ type: "lifecycle.foreground" }).catch((err) =>
+          reportDispatchError("lifecycle.foreground", err),
+        );
+        if (lastVisibility === "hidden") {
+          void dispatchHostEvent({ type: "lifecycle.resume" }).catch((err) =>
+            reportDispatchError("lifecycle.resume", err),
+          );
+        }
+      }
+      lastVisibility = nextVisibility;
+    });
+    globalThis.addEventListener?.("online", () => {
+      void dispatchHostEvent({ type: "connectivity.online" }).catch((err) =>
+        reportDispatchError("connectivity.online", err),
+      );
+    });
+    globalThis.addEventListener?.("offline", () => {
+      void dispatchHostEvent({ type: "connectivity.offline" }).catch((err) =>
+        reportDispatchError("connectivity.offline", err),
+      );
+    });
+  }
+
   try {
     const event = { type: "init" };
     const env0 = { v: 1, kind: "x07.web_ui.dispatch", state: null, event };
     const out = await callReducer(env0, true);
     commitFrame(out.frame);
     await runEffectsLoop(event, env0, out.frame, out.wallMs);
+    installDeviceEventSources();
   } catch (err) {
     emitTelemetry(
       "runtime.error",

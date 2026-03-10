@@ -1,14 +1,18 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::Digest as _;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
@@ -96,6 +100,7 @@ enum UserEvent {
     UiReady,
     UiError,
     Timeout,
+    DispatchScript(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,6 +179,541 @@ struct RunState {
     ui_ready: bool,
     ui_error: Option<String>,
     timeout: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlobManifestDoc {
+    handle: String,
+    sha256: String,
+    mime: String,
+    byte_size: u64,
+    created_at_ms: u64,
+    source: String,
+    local_state: String,
+}
+
+#[derive(Debug)]
+struct BlobSandbox {
+    root: PathBuf,
+    max_total_bytes: u64,
+    max_item_bytes: u64,
+}
+
+#[derive(Debug)]
+struct BlobSandboxError {
+    code: &'static str,
+    message: String,
+}
+
+struct DesktopNativeRuntime {
+    capabilities: Value,
+    blob_sandbox: BlobSandbox,
+    notifications: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    proxy: EventLoopProxy<UserEvent>,
+    telemetry: Arc<telemetry::TelemetryCoordinator>,
+}
+
+impl DesktopNativeRuntime {
+    fn new(
+        bundle_dir: &Path,
+        capabilities: Value,
+        proxy: EventLoopProxy<UserEvent>,
+        telemetry: Arc<telemetry::TelemetryCoordinator>,
+    ) -> Result<Self> {
+        let blob_sandbox = BlobSandbox::new(bundle_dir, &capabilities)?;
+        Ok(Self {
+            capabilities,
+            blob_sandbox,
+            notifications: Mutex::new(BTreeMap::new()),
+            proxy,
+            telemetry,
+        })
+    }
+
+    fn handle_request(&self, request: &Value) -> Value {
+        let started = Instant::now();
+        let family = request
+            .get("family")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let capability = request
+            .get("capability")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !desktop_capability_allowed(&self.capabilities, capability) {
+            let reply = json!({
+                "family": family,
+                "result": desktop_result_doc(request, "unsupported", json!({}), json!({
+                    "platform": "desktop",
+                    "provider": "desktop_native",
+                })),
+            });
+            self.telemetry.emit_native_event(
+                "policy.violation",
+                "device.capability.denied",
+                "warn",
+                desktop_device_telemetry_attrs(
+                    request,
+                    "unsupported",
+                    started.elapsed().as_millis() as u64,
+                    [],
+                ),
+            );
+            return reply;
+        }
+
+        let reply = match family.as_str() {
+            "permissions" => self.handle_permissions_request(request),
+            "files" => self.handle_files_request(request),
+            "blobs" => self.handle_blobs_request(request),
+            "notifications" => self.handle_notifications_request(request),
+            _ => json!({
+                "family": family,
+                "result": desktop_result_doc(request, "unsupported", json!({}), json!({
+                    "platform": "desktop",
+                    "provider": "desktop_native",
+                })),
+            }),
+        };
+        let status = reply
+            .pointer("/result/status")
+            .and_then(Value::as_str)
+            .unwrap_or("error");
+        self.telemetry.emit_native_event(
+            if status == "error" {
+                "runtime.error"
+            } else {
+                "bridge.timing"
+            },
+            if status == "error" {
+                "device.op.error"
+            } else {
+                "device.op.result"
+            },
+            if status == "error" { "error" } else { "info" },
+            desktop_device_telemetry_attrs(
+                request,
+                status,
+                started.elapsed().as_millis() as u64,
+                [],
+            ),
+        );
+        reply
+    }
+
+    fn handle_files_request(&self, request: &Value) -> Value {
+        if !desktop_capability_allowed(&self.capabilities, "blob_store") {
+            return json!({
+                "family": "files",
+                "result": desktop_result_doc(
+                    request,
+                    "unsupported",
+                    json!({ "reason": "blob_store_disabled" }),
+                    json!({
+                        "platform": "desktop",
+                        "provider": "desktop_native",
+                    }),
+                ),
+            });
+        }
+
+        let accepts = desktop_request_accepts(request, &self.capabilities);
+        let Some(path) = desktop_pick_file(&accepts) else {
+            return json!({
+                "family": "files",
+                "result": desktop_result_doc(
+                    request,
+                    "cancelled",
+                    json!({}),
+                    json!({
+                        "platform": "desktop",
+                        "provider": "desktop_native",
+                    }),
+                ),
+            });
+        };
+
+        match fs::read(&path) {
+            Ok(bytes) => {
+                match self
+                    .blob_sandbox
+                    .put(&bytes, &desktop_mime_type_for_path(&path), "files")
+                {
+                    Ok(manifest) => json!({
+                        "family": "files",
+                        "result": desktop_result_doc(
+                            request,
+                            "ok",
+                            json!({
+                                "blobs": [manifest_value(&manifest)],
+                                "path": path.display().to_string(),
+                            }),
+                            json!({
+                                "platform": "desktop",
+                                "provider": "desktop_native",
+                            }),
+                        ),
+                    }),
+                    Err(err) => json!({
+                        "family": "files",
+                        "result": desktop_result_doc(
+                            request,
+                            "error",
+                            json!({
+                                "reason": err.code,
+                                "message": err.message,
+                            }),
+                            json!({
+                                "platform": "desktop",
+                                "provider": "desktop_native",
+                            }),
+                        ),
+                    }),
+                }
+            }
+            Err(err) => json!({
+                "family": "files",
+                "result": desktop_result_doc(
+                    request,
+                    "error",
+                    json!({
+                        "message": format!("failed to read file {}: {err}", path.display()),
+                    }),
+                    json!({
+                        "platform": "desktop",
+                        "provider": "desktop_native",
+                    }),
+                ),
+            }),
+        }
+    }
+
+    fn handle_blobs_request(&self, request: &Value) -> Value {
+        let handle = request
+            .pointer("/payload/handle")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let result = if request.get("op").and_then(Value::as_str) == Some("blobs.delete") {
+            self.blob_sandbox.delete(handle)
+        } else {
+            self.blob_sandbox.stat(handle)
+        };
+        match result {
+            Ok(blob) => json!({
+                "family": "blobs",
+                "result": desktop_result_doc(
+                    request,
+                    "ok",
+                    json!({ "blob": manifest_value(&blob) }),
+                    json!({
+                        "platform": "desktop",
+                        "provider": "desktop_native",
+                    }),
+                ),
+            }),
+            Err(err) => json!({
+                "family": "blobs",
+                "result": desktop_result_doc(
+                    request,
+                    "error",
+                    json!({ "message": format!("{err:#}") }),
+                    json!({
+                        "platform": "desktop",
+                        "provider": "desktop_native",
+                    }),
+                ),
+            }),
+        }
+    }
+
+    fn handle_permissions_request(&self, request: &Value) -> Value {
+        let permission = request
+            .pointer("/payload/permission")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let (status, state) = match permission {
+            "notifications" => ("ok", "granted"),
+            "camera" | "location_foreground" => ("unsupported", "unsupported"),
+            _ => ("unsupported", "unsupported"),
+        };
+        json!({
+            "family": "permissions",
+            "result": desktop_result_doc(
+                request,
+                status,
+                json!({
+                    "permission": permission,
+                    "state": state,
+                }),
+                json!({
+                    "platform": "desktop",
+                    "provider": "desktop_native",
+                }),
+            ),
+        })
+    }
+
+    fn handle_notifications_request(&self, request: &Value) -> Value {
+        let notification_id = request
+            .pointer("/payload/notification_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                request
+                    .pointer("/payload/id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| {
+                request
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            })
+            .to_string();
+
+        if request.get("op").and_then(Value::as_str) == Some("notifications.cancel") {
+            self.cancel_notification(&notification_id);
+            return json!({
+                "family": "notifications",
+                "result": desktop_result_doc(
+                    request,
+                    "ok",
+                    json!({ "notification_id": notification_id }),
+                    json!({
+                        "platform": "desktop",
+                        "provider": "desktop_native",
+                    }),
+                ),
+            });
+        }
+
+        let delay_ms = request
+            .pointer("/payload/delay_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        self.schedule_notification(notification_id.clone(), delay_ms);
+        json!({
+            "family": "notifications",
+            "result": desktop_result_doc(
+                request,
+                "ok",
+                json!({ "notification_id": notification_id }),
+                json!({
+                    "platform": "desktop",
+                    "provider": "desktop_native",
+                }),
+            ),
+        })
+    }
+
+    fn cancel_notification(&self, notification_id: &str) {
+        let mut guard = self
+            .notifications
+            .lock()
+            .expect("lock desktop notification registry");
+        if let Some(cancelled) = guard.remove(notification_id) {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn schedule_notification(&self, notification_id: String, delay_ms: u64) {
+        self.cancel_notification(&notification_id);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.notifications
+            .lock()
+            .expect("lock desktop notification registry")
+            .insert(notification_id.clone(), cancelled.clone());
+        let proxy = self.proxy.clone();
+        let telemetry = self.telemetry.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            telemetry.emit_native_event(
+                "app.lifecycle",
+                "notification.opened",
+                "info",
+                btreemap1("notification_id", Value::String(notification_id.clone())),
+            );
+            let doc = json!({
+                "type": "notification.opened",
+                "notification_id": notification_id,
+            });
+            let _ = proxy.send_event(UserEvent::DispatchScript(bridge_event_script(&doc)));
+        });
+    }
+}
+
+impl BlobSandbox {
+    fn new(bundle_dir: &Path, capabilities: &Value) -> Result<Self> {
+        let root = bundle_dir.join(".x07-device-host").join("blob_store");
+        fs::create_dir_all(root.join("data")).context("create blob_store/data")?;
+        fs::create_dir_all(root.join("meta")).context("create blob_store/meta")?;
+        Ok(Self {
+            root,
+            max_total_bytes: capabilities
+                .pointer("/device/blob_store/max_total_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(64 * 1024 * 1024),
+            max_item_bytes: capabilities
+                .pointer("/device/blob_store/max_item_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(16 * 1024 * 1024),
+        })
+    }
+
+    fn put(
+        &self,
+        bytes: &[u8],
+        mime: &str,
+        source: &str,
+    ) -> std::result::Result<BlobManifestDoc, BlobSandboxError> {
+        if bytes.len() as u64 > self.max_item_bytes {
+            return Err(BlobSandboxError {
+                code: "blob_item_too_large",
+                message: "blob item exceeds max_item_bytes".to_string(),
+            });
+        }
+        let sha256 = {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())
+        };
+        if let Some(existing) = self
+            .read_manifest(&sha256)
+            .map_err(|err| BlobSandboxError {
+                code: "blob_manifest_read_failed",
+                message: format!("{err:#}"),
+            })?
+        {
+            if self.blob_path(&sha256).is_file() && existing.local_state == "present" {
+                return Ok(existing);
+            }
+        }
+        if self.total_present_bytes().map_err(|err| BlobSandboxError {
+            code: "blob_total_bytes_failed",
+            message: format!("{err:#}"),
+        })? + bytes.len() as u64
+            > self.max_total_bytes
+        {
+            return Err(BlobSandboxError {
+                code: "blob_total_too_large",
+                message: "blob store exceeds max_total_bytes".to_string(),
+            });
+        }
+
+        let manifest = BlobManifestDoc {
+            handle: format!("blob:sha256:{sha256}"),
+            sha256: sha256.clone(),
+            mime: mime.to_string(),
+            byte_size: bytes.len() as u64,
+            created_at_ms: unix_time_ms(),
+            source: source.to_string(),
+            local_state: "present".to_string(),
+        };
+        let blob_path = self.blob_path(&sha256);
+        let temp_path = blob_path.with_extension(format!("tmp-{}", std::process::id()));
+        fs::write(&temp_path, bytes).map_err(|err| BlobSandboxError {
+            code: "blob_write_failed",
+            message: format!("write {}: {err}", temp_path.display()),
+        })?;
+        fs::rename(&temp_path, &blob_path)
+            .or_else(|_| {
+                fs::copy(&temp_path, &blob_path)?;
+                fs::remove_file(&temp_path)
+            })
+            .map_err(|err| BlobSandboxError {
+                code: "blob_write_failed",
+                message: format!(
+                    "move {} -> {}: {err}",
+                    temp_path.display(),
+                    blob_path.display()
+                ),
+            })?;
+        self.write_manifest(&manifest)
+            .map_err(|err| BlobSandboxError {
+                code: "blob_manifest_write_failed",
+                message: format!("{err:#}"),
+            })?;
+        Ok(manifest)
+    }
+
+    fn stat(&self, handle: &str) -> Result<BlobManifestDoc> {
+        let Some(sha256) = blob_sha_from_handle(handle) else {
+            return Ok(missing_blob_manifest(handle, "blob_store"));
+        };
+        let Some(mut manifest) = self.read_manifest(sha256)? else {
+            return Ok(missing_blob_manifest(handle, "blob_store"));
+        };
+        if manifest.local_state != "deleted" && !self.blob_path(sha256).is_file() {
+            manifest.local_state = "missing".to_string();
+        }
+        Ok(manifest)
+    }
+
+    fn delete(&self, handle: &str) -> Result<BlobManifestDoc> {
+        let Some(sha256) = blob_sha_from_handle(handle) else {
+            return Ok(missing_blob_manifest(handle, "blob_store"));
+        };
+        let Some(mut manifest) = self.read_manifest(sha256)? else {
+            return Ok(missing_blob_manifest(handle, "blob_store"));
+        };
+        let blob_path = self.blob_path(sha256);
+        if blob_path.is_file() {
+            fs::remove_file(&blob_path)
+                .with_context(|| format!("remove {}", blob_path.display()))?;
+        }
+        manifest.local_state = "deleted".to_string();
+        self.write_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    fn total_present_bytes(&self) -> Result<u64> {
+        let mut total = 0_u64;
+        for entry in fs::read_dir(self.root.join("meta")).context("read blob meta dir")? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let bytes = fs::read(entry.path())
+                .with_context(|| format!("read {}", entry.path().display()))?;
+            let manifest: BlobManifestDoc = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", entry.path().display()))?;
+            if manifest.local_state == "present" {
+                total = total.saturating_add(manifest.byte_size);
+            }
+        }
+        Ok(total)
+    }
+
+    fn read_manifest(&self, sha256: &str) -> Result<Option<BlobManifestDoc>> {
+        let path = self.manifest_path(sha256);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let manifest =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    fn write_manifest(&self, manifest: &BlobManifestDoc) -> Result<()> {
+        let path = self.manifest_path(&manifest.sha256);
+        let bytes = serde_json::to_vec_pretty(manifest).context("serialize blob manifest")?;
+        fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    fn blob_path(&self, sha256: &str) -> PathBuf {
+        self.root.join("data").join(format!("{sha256}.bin"))
+    }
+
+    fn manifest_path(&self, sha256: &str) -> PathBuf {
+        self.root.join("meta").join(format!("{sha256}.json"))
+    }
 }
 
 fn main() -> std::process::ExitCode {
@@ -434,6 +974,8 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         },
     );
 
+    let mut capabilities_doc = Value::Null;
+
     for (role, file_ref) in [
         (
             "profile",
@@ -471,6 +1013,9 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
             }
         };
         inputs.push(file_digest_bytes(&path, &bytes));
+        if role == "capabilities" {
+            capabilities_doc = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        }
         bundle_files.insert(
             serve_path_for(&file_ref.path),
             ServedFile {
@@ -490,6 +1035,35 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
 
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let native_runtime = match DesktopNativeRuntime::new(
+        &bundle_dir,
+        capabilities_doc,
+        proxy.clone(),
+        telemetry.clone(),
+    ) {
+        Ok(runtime) => Arc::new(runtime),
+        Err(err) => {
+            diagnostics.push(diag(
+                "X07DEVHOST_BLOB_SANDBOX_INIT_FAILED",
+                "error",
+                "run",
+                format!("failed to initialize blob sandbox: {err:#}"),
+                None,
+            ));
+            return emit_and_exit(
+                raw_argv,
+                started,
+                &bundle_dir,
+                false,
+                false,
+                diagnostics,
+                inputs,
+                outputs,
+                manifest.telemetry_profile.is_some(),
+                args.json,
+            );
+        }
+    };
 
     if args.headless_smoke {
         spawn_timeout(proxy.clone(), Duration::from_secs(2));
@@ -501,29 +1075,39 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         .context("create tao window")?;
 
     let url = "x07://localhost/index.html";
+    let webview_slot: Rc<RefCell<Option<wry::WebView>>> = Rc::new(RefCell::new(None));
 
     let protocol_state = state.clone();
     let ipc_proxy = proxy.clone();
     let ipc_run_state = run_state.clone();
     let ipc_telemetry = telemetry.clone();
-    let _webview = WebViewBuilder::new()
+    let ipc_native_runtime = native_runtime.clone();
+    let webview = WebViewBuilder::new()
         .with_custom_protocol("x07".to_string(), move |_id, request| {
             handle_custom_protocol(protocol_state.clone(), request)
         })
         .with_navigation_handler(|nav_url| navigation_allowed(&nav_url))
+        .with_initialization_script(r#"globalThis.__x07DeviceNativeBridge = "m0";"#)
         .with_ipc_handler(move |request| {
             handle_ipc(
                 &ipc_proxy,
                 &ipc_run_state,
                 &ipc_telemetry,
+                &ipc_native_runtime,
                 request.body().to_string(),
             );
         })
         .with_url(url)
         .build(&window)
         .context("build webview")?;
+    *webview_slot.borrow_mut() = Some(webview);
 
-    run_event_loop(event_loop, run_state.clone(), args.headless_smoke);
+    run_event_loop(
+        event_loop,
+        run_state.clone(),
+        args.headless_smoke,
+        webview_slot,
+    );
 
     let final_state = run_state.lock().expect("lock run_state");
     let ui_ready = final_state.ui_ready;
@@ -573,6 +1157,7 @@ fn run_event_loop(
     event_loop: EventLoop<UserEvent>,
     run_state: Arc<Mutex<RunState>>,
     headless_smoke: bool,
+    webview: Rc<RefCell<Option<wry::WebView>>>,
 ) {
     use tao::platform::run_return::EventLoopExtRunReturn as _;
 
@@ -597,6 +1182,11 @@ fn run_event_loop(
                 }
                 *control_flow = ControlFlow::Exit;
             }
+            Event::UserEvent(UserEvent::DispatchScript(script)) => {
+                if let Some(webview) = webview.borrow().as_ref() {
+                    let _ = webview.evaluate_script(&script);
+                }
+            }
             _ => {}
         }
     });
@@ -607,6 +1197,7 @@ fn run_event_loop(
     _event_loop: EventLoop<UserEvent>,
     _run_state: Arc<Mutex<RunState>>,
     _headless_smoke: bool,
+    _webview: Rc<RefCell<Option<wry::WebView>>>,
 ) {
     unreachable!("unsupported platform for x07-device-host-desktop");
 }
@@ -615,6 +1206,7 @@ fn handle_ipc(
     proxy: &EventLoopProxy<UserEvent>,
     run_state: &Arc<Mutex<RunState>>,
     telemetry: &Arc<telemetry::TelemetryCoordinator>,
+    native_runtime: &Arc<DesktopNativeRuntime>,
     msg: String,
 ) {
     if msg.len() > 128 * 1024 {
@@ -635,6 +1227,22 @@ fn handle_ipc(
     };
     let kind = doc.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     match kind {
+        "x07.device.native.request" => {
+            let bridge_request_id = doc
+                .get("bridge_request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if bridge_request_id.is_empty() {
+                return;
+            }
+            let request = doc.get("request").cloned().unwrap_or(Value::Null);
+            let result = native_runtime.handle_request(&request);
+            let reply = json!({
+                "bridge_request_id": bridge_request_id,
+                "result": result,
+            });
+            let _ = proxy.send_event(UserEvent::DispatchScript(bridge_reply_script(&reply)));
+        }
         "x07.device.ui.ready" => {
             if let Ok(mut st) = run_state.lock() {
                 st.ui_ready = true;
@@ -874,6 +1482,216 @@ fn spawn_timeout(proxy: EventLoopProxy<UserEvent>, duration: Duration) {
     });
 }
 
+fn desktop_capability_allowed(capabilities: &Value, capability: &str) -> bool {
+    let device = capabilities.get("device");
+    match capability {
+        "camera.photo" => device
+            .and_then(|value| value.get("camera"))
+            .and_then(|value| value.get("photo"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "files.pick" => device
+            .and_then(|value| value.get("files"))
+            .and_then(|value| value.get("pick"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "blob_store" => device
+            .and_then(|value| value.get("blob_store"))
+            .and_then(|value| value.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "location.foreground" => device
+            .and_then(|value| value.get("location"))
+            .and_then(|value| value.get("foreground"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "notifications.local" => device
+            .and_then(|value| value.get("notifications"))
+            .and_then(|value| value.get("local"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn desktop_result_doc(request: &Value, status: &str, payload: Value, host_meta: Value) -> Value {
+    json!({
+        "request_id": request.get("request_id").and_then(Value::as_str).unwrap_or(""),
+        "op": request.get("op").and_then(Value::as_str).unwrap_or(""),
+        "capability": request.get("capability").and_then(Value::as_str).unwrap_or(""),
+        "status": status,
+        "payload": payload,
+        "host_meta": host_meta,
+    })
+}
+
+fn bridge_reply_script(doc: &Value) -> String {
+    format!(
+        "globalThis.__x07ReceiveDeviceReply?.({});",
+        serde_json::to_string(doc).unwrap_or_else(|_| "null".to_string())
+    )
+}
+
+fn bridge_event_script(doc: &Value) -> String {
+    format!(
+        "globalThis.__x07DispatchDeviceEvent?.({});",
+        serde_json::to_string(doc).unwrap_or_else(|_| "null".to_string())
+    )
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_millis(0))
+        .as_millis() as u64
+}
+
+fn blob_sha_from_handle(handle: &str) -> Option<&str> {
+    handle
+        .strip_prefix("blob:sha256:")
+        .filter(|value| !value.is_empty())
+}
+
+fn missing_blob_manifest(handle: &str, source: &str) -> BlobManifestDoc {
+    BlobManifestDoc {
+        handle: handle.to_string(),
+        sha256: blob_sha_from_handle(handle).unwrap_or_default().to_string(),
+        mime: "application/octet-stream".to_string(),
+        byte_size: 0,
+        created_at_ms: 0,
+        source: source.to_string(),
+        local_state: "missing".to_string(),
+    }
+}
+
+fn manifest_value(manifest: &BlobManifestDoc) -> Value {
+    serde_json::to_value(manifest).unwrap_or_else(|_| json!({}))
+}
+
+fn desktop_request_accepts(request: &Value, capabilities: &Value) -> Vec<String> {
+    let payload_accepts = request
+        .pointer("/payload/accept")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !payload_accepts.is_empty() {
+        return payload_accepts;
+    }
+    capabilities
+        .pointer("/device/files/accept_defaults")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn desktop_pick_file(accepts: &[String]) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title("Pick a file for x07");
+    let mut has_filter = false;
+    if accepts
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case("image/*"))
+    {
+        dialog = dialog.add_filter(
+            "Images",
+            &["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif"],
+        );
+        has_filter = true;
+    }
+    if accepts
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case("application/pdf"))
+    {
+        dialog = dialog.add_filter("PDF", &["pdf"]);
+        has_filter = true;
+    }
+    let ext_filters = accepts
+        .iter()
+        .filter_map(|item| item.strip_prefix('.'))
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>();
+    if !ext_filters.is_empty() {
+        let ext_slices = ext_filters.iter().map(String::as_str).collect::<Vec<_>>();
+        dialog = dialog.add_filter("Files", &ext_slices);
+        has_filter = true;
+    }
+    let _ = has_filter;
+    dialog.pick_file()
+}
+
+fn desktop_mime_type_for_path(path: &Path) -> String {
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string()
+}
+
+fn desktop_device_telemetry_attrs(
+    request: &Value,
+    status: &str,
+    duration_ms: u64,
+    extra: impl IntoIterator<Item = (&'static str, Value)>,
+) -> BTreeMap<String, Value> {
+    let mut attrs = BTreeMap::new();
+    attrs.insert(
+        "x07.device.op".to_string(),
+        Value::String(
+            request
+                .get("op")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+    );
+    attrs.insert(
+        "x07.device.request_id".to_string(),
+        Value::String(
+            request
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+    );
+    attrs.insert(
+        "x07.device.status".to_string(),
+        Value::String(status.to_string()),
+    );
+    attrs.insert(
+        "x07.device.capability".to_string(),
+        Value::String(
+            request
+                .get("capability")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+    );
+    attrs.insert(
+        "x07.device.platform".to_string(),
+        Value::String("desktop".to_string()),
+    );
+    attrs.insert(
+        "x07.device.duration_ms".to_string(),
+        Value::Number(duration_ms.into()),
+    );
+    for (key, value) in extra {
+        attrs.insert(key.to_string(), value);
+    }
+    attrs
+}
+
 fn default_bundle_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(dir) = infer_bundle_dir_from_exe(&exe) {
@@ -1013,6 +1831,16 @@ fn emit_and_exit(
 mod tests {
     use super::*;
 
+    fn temp_bundle_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "x07-device-host-desktop-{name}-{}-{}",
+            std::process::id(),
+            unix_time_ms()
+        ));
+        fs::create_dir_all(&dir).expect("create temp bundle dir");
+        dir
+    }
+
     #[test]
     fn bundle_manifest_sidecars_deserialize() {
         let doc = serde_json::from_value::<BundleManifestDoc>(serde_json::json!({
@@ -1076,5 +1904,63 @@ mod tests {
         let err = resolve_bundle_path(Path::new("bundle"), "../secrets.json")
             .expect_err("path traversal should be rejected");
         assert!(err.contains("bundle root"));
+    }
+
+    #[test]
+    fn blob_sandbox_put_stat_delete_roundtrip() {
+        let bundle_dir = temp_bundle_dir("blob-roundtrip");
+        let sandbox = BlobSandbox::new(
+            &bundle_dir,
+            &json!({
+                "device": {
+                    "blob_store": {
+                        "enabled": true,
+                        "max_total_bytes": 1024,
+                        "max_item_bytes": 512
+                    }
+                }
+            }),
+        )
+        .expect("create blob sandbox");
+
+        let manifest = sandbox
+            .put(b"hello", "text/plain", "files")
+            .expect("store blob");
+        let stat = sandbox.stat(&manifest.handle).expect("stat blob");
+        assert_eq!(stat.handle, manifest.handle);
+        assert_eq!(stat.local_state, "present");
+
+        let deleted = sandbox.delete(&manifest.handle).expect("delete blob");
+        assert_eq!(deleted.local_state, "deleted");
+
+        let after_delete = sandbox.stat(&manifest.handle).expect("stat after delete");
+        assert_eq!(after_delete.local_state, "deleted");
+
+        let _ = fs::remove_dir_all(bundle_dir);
+    }
+
+    #[test]
+    fn blob_sandbox_enforces_item_quota() {
+        let bundle_dir = temp_bundle_dir("blob-quota");
+        let sandbox = BlobSandbox::new(
+            &bundle_dir,
+            &json!({
+                "device": {
+                    "blob_store": {
+                        "enabled": true,
+                        "max_total_bytes": 1024,
+                        "max_item_bytes": 4
+                    }
+                }
+            }),
+        )
+        .expect("create blob sandbox");
+
+        let err = sandbox
+            .put(b"hello", "text/plain", "files")
+            .expect_err("quota should reject oversized blob");
+        assert_eq!(err.code, "blob_item_too_large");
+
+        let _ = fs::remove_dir_all(bundle_dir);
     }
 }
