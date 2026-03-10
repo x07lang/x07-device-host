@@ -79,6 +79,13 @@ x07-wasm device package --bundle dist/device --target android --out-dir dist/and
 
 Generated projects embed the device bundle under `x07/` — no remote code loading at runtime.
 
+Generated Android projects now include a pinned Gradle wrapper (`./gradlew`) for the AGP 8.2 line used by the template. Run Android builds with a supported JDK (17 or 21); on a workstation with Android Studio installed, the bundled JBR works:
+
+```bash
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+./gradlew assembleDebug
+```
+
 Current device bundles may embed these sidecars under `profile/`:
 
 - `device.profile.json`
