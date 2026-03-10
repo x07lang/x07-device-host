@@ -1963,4 +1963,33 @@ mod tests {
 
         let _ = fs::remove_dir_all(bundle_dir);
     }
+
+    #[test]
+    fn blob_sandbox_enforces_total_quota() {
+        let bundle_dir = temp_bundle_dir("blob-total-quota");
+        let sandbox = BlobSandbox::new(
+            &bundle_dir,
+            &json!({
+                "device": {
+                    "blob_store": {
+                        "enabled": true,
+                        "max_total_bytes": 8,
+                        "max_item_bytes": 8
+                    }
+                }
+            }),
+        )
+        .expect("create blob sandbox");
+
+        sandbox
+            .put(b"rust", "text/plain", "files")
+            .expect("store first blob");
+
+        let err = sandbox
+            .put(b"tools", "text/plain", "files")
+            .expect_err("quota should reject total blob size overflow");
+        assert_eq!(err.code, "blob_total_too_large");
+
+        let _ = fs::remove_dir_all(bundle_dir);
+    }
 }
