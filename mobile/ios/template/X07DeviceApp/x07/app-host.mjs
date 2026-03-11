@@ -2113,7 +2113,7 @@ export async function mountWebUiApp({
         const storageSet = parseStorageSetEffect(eff);
         if (storageSet) {
           globalThis.localStorage?.setItem?.(storageSet.key, storageSet.value);
-          const inj = { set: { key: storageSet.key, value: storageSet.value, ok: true } };
+          const inj = { set: { ok: true } };
           const prev = injectedState.__x07_storage;
           injectedState.__x07_storage =
             prev && typeof prev === "object" && !Array.isArray(prev) ? { ...prev, ...inj } : inj;
