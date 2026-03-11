@@ -275,10 +275,12 @@ impl DesktopNativeRuntime {
         }
 
         let reply = match family.as_str() {
+            "audio" => self.handle_audio_request(request),
             "permissions" => self.handle_permissions_request(request),
             "clipboard" => self.handle_clipboard_request(request),
             "files" => self.handle_files_request(request),
             "blobs" => self.handle_blobs_request(request),
+            "haptics" => self.handle_haptics_request(request),
             "notifications" => self.handle_notifications_request(request),
             "share" => self.handle_share_request(request),
             _ => json!({
@@ -296,11 +298,7 @@ impl DesktopNativeRuntime {
             } else {
                 "bridge.timing"
             },
-            if status == "error" {
-                "device.op.error"
-            } else {
-                "device.op.result"
-            },
+            desktop_device_telemetry_name(request, status),
             if status == "error" { "error" } else { "info" },
             desktop_device_telemetry_attrs(
                 request,
@@ -310,6 +308,10 @@ impl DesktopNativeRuntime {
             ),
         );
         reply
+    }
+
+    fn handle_audio_request(&self, request: &Value) -> Value {
+        desktop_unsupported_device_reply(request, "audio", "shared_host_audio")
     }
 
     fn handle_clipboard_request(&self, request: &Value) -> Value {
@@ -685,6 +687,10 @@ impl DesktopNativeRuntime {
                 }),
             ),
         })
+    }
+
+    fn handle_haptics_request(&self, request: &Value) -> Value {
+        desktop_unsupported_device_reply(request, "haptics", "unsupported_platform")
     }
 
     fn handle_notifications_request(&self, request: &Value) -> Value {
@@ -1870,6 +1876,11 @@ fn spawn_timeout(proxy: EventLoopProxy<UserEvent>, duration: Duration) {
 fn desktop_capability_allowed(capabilities: &Value, capability: &str) -> bool {
     let device = capabilities.get("device");
     match capability {
+        "audio.playback" => device
+            .and_then(|value| value.get("audio"))
+            .and_then(|value| value.get("playback"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         "camera.photo" => device
             .and_then(|value| value.get("camera"))
             .and_then(|value| value.get("photo"))
@@ -1924,6 +1935,11 @@ fn desktop_capability_allowed(capabilities: &Value, capability: &str) -> bool {
             .and_then(|value| value.get("enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "haptics.present" => device
+            .and_then(|value| value.get("haptics"))
+            .and_then(|value| value.get("present"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         "location.foreground" => device
             .and_then(|value| value.get("location"))
             .and_then(|value| value.get("foreground"))
@@ -1958,6 +1974,18 @@ fn desktop_host_meta() -> Value {
     json!({
         "platform": "desktop",
         "provider": "desktop_native",
+    })
+}
+
+fn desktop_unsupported_device_reply(request: &Value, family: &str, reason: &str) -> Value {
+    json!({
+        "family": family,
+        "result": desktop_result_doc(
+            request,
+            "unsupported",
+            json!({ "reason": reason }),
+            desktop_host_meta(),
+        ),
     })
 }
 
@@ -2182,6 +2210,16 @@ fn desktop_device_telemetry_attrs(
         attrs.insert(key.to_string(), value);
     }
     attrs
+}
+
+fn desktop_device_telemetry_name(request: &Value, status: &str) -> &'static str {
+    match request.get("op").and_then(Value::as_str).unwrap_or("") {
+        "audio.play" => "device.audio.play",
+        "audio.stop" => "device.audio.stop",
+        "haptics.trigger" => "device.haptics.trigger",
+        _ if status == "error" => "device.op.error",
+        _ => "device.op.result",
+    }
 }
 
 fn default_bundle_dir() -> PathBuf {
@@ -2493,6 +2531,9 @@ mod tests {
     fn desktop_capability_allowed_recognizes_builder_io_flags() {
         let capabilities = json!({
             "device": {
+                "audio": {
+                    "playback": true
+                },
                 "clipboard": {
                     "read_text": true,
                     "write_text": true
@@ -2503,12 +2544,16 @@ mod tests {
                     "save": true,
                     "drop": true
                 },
+                "haptics": {
+                    "present": true
+                },
                 "share": {
                     "present": true
                 }
             }
         });
 
+        assert!(desktop_capability_allowed(&capabilities, "audio.playback"));
         assert!(desktop_capability_allowed(
             &capabilities,
             "clipboard.read_text"
@@ -2523,6 +2568,23 @@ mod tests {
         ));
         assert!(desktop_capability_allowed(&capabilities, "files.save"));
         assert!(desktop_capability_allowed(&capabilities, "files.drop"));
+        assert!(desktop_capability_allowed(&capabilities, "haptics.present"));
         assert!(desktop_capability_allowed(&capabilities, "share.present"));
+    }
+
+    #[test]
+    fn desktop_device_telemetry_name_prefers_explicit_ops() {
+        assert_eq!(
+            desktop_device_telemetry_name(&json!({ "op": "audio.play" }), "ok"),
+            "device.audio.play"
+        );
+        assert_eq!(
+            desktop_device_telemetry_name(&json!({ "op": "haptics.trigger" }), "ok"),
+            "device.haptics.trigger"
+        );
+        assert_eq!(
+            desktop_device_telemetry_name(&json!({}), "error"),
+            "device.op.error"
+        );
     }
 }

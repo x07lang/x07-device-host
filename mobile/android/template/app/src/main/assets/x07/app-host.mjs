@@ -1164,6 +1164,10 @@ function capabilityAllowed(capabilities, capability) {
   switch (String(capability || "")) {
     case "camera.photo":
       return device?.camera?.photo === true;
+    case "audio.playback":
+      return device?.audio?.playback === true;
+    case "haptics.present":
+      return device?.haptics?.present === true;
     case "clipboard.read_text":
       return device?.clipboard?.read_text === true;
     case "clipboard.write_text":
@@ -1393,6 +1397,35 @@ function parseDeviceCameraEffect(effect) {
   );
 }
 
+function parseDeviceAudioEffect(effect) {
+  return (
+    parseCommonDeviceRequest(
+      effect,
+      "x07.web_ui.effect.device.audio.play",
+      "audio",
+      "audio.play",
+      "audio.playback",
+    ) ||
+    parseCommonDeviceRequest(
+      effect,
+      "x07.web_ui.effect.device.audio.stop",
+      "audio",
+      "audio.stop",
+      "audio.playback",
+    )
+  );
+}
+
+function parseDeviceHapticsEffect(effect) {
+  return parseCommonDeviceRequest(
+    effect,
+    "x07.web_ui.effect.device.haptics.trigger",
+    "haptics",
+    "haptics.trigger",
+    "haptics.present",
+  );
+}
+
 function parseDeviceClipboardEffect(effect) {
   return (
     parseCommonDeviceRequest(
@@ -1515,6 +1548,8 @@ function parseAnyDeviceEffect(effect) {
   return (
     parseDevicePermissionsEffect(effect) ||
     parseDeviceCameraEffect(effect) ||
+    parseDeviceAudioEffect(effect) ||
+    parseDeviceHapticsEffect(effect) ||
     parseDeviceClipboardEffect(effect) ||
     parseDeviceFilesEffect(effect) ||
     parseDeviceBlobsStatEffect(effect) ||
@@ -1585,6 +1620,235 @@ function createInMemoryBlobStore(capabilities) {
       items.delete(key);
       totalBytes -= item.bytes.length;
       return { ...item.manifest, local_state: "deleted" };
+    },
+  };
+}
+
+const AUDIO_CUES = {
+  select: { type: "triangle", notes: [880], durationMs: 70, stepMs: 0, gain: 0.035 },
+  move: { type: "triangle", notes: [660, 880], durationMs: 70, stepMs: 65, gain: 0.032 },
+  confirm: { type: "triangle", notes: [740, 988], durationMs: 90, stepMs: 80, gain: 0.034 },
+  attack: { type: "square", notes: [220, 196, 174], durationMs: 95, stepMs: 45, gain: 0.038 },
+  victory: { type: "triangle", notes: [523.25, 659.25, 783.99], durationMs: 180, stepMs: 120, gain: 0.03 },
+  defeat: { type: "sawtooth", notes: [330, 262, 196], durationMs: 200, stepMs: 140, gain: 0.026 },
+  music_loop: { type: "sine", notes: [196], durationMs: 0, stepMs: 0, gain: 0.018 },
+};
+
+const HAPTIC_PATTERNS = {
+  selection: [10],
+  impact: [25],
+  victory: [18, 36, 18],
+  defeat: [45, 24, 55],
+};
+
+function audioCueSpec(cue) {
+  return AUDIO_CUES[String(cue || "")] || null;
+}
+
+function hapticPatternSpec(pattern) {
+  return HAPTIC_PATTERNS[String(pattern || "")] || null;
+}
+
+function makeAudioCleanup(entry) {
+  return () => {
+    for (const timeoutHandle of entry.timeouts) clearTimeout(timeoutHandle);
+    entry.timeouts.length = 0;
+    for (const oscillator of entry.oscillators) {
+      try {
+        oscillator.stop?.();
+      } catch (_) {
+        // ignore stop races when the voice already ended
+      }
+      try {
+        oscillator.disconnect?.();
+      } catch (_) {
+        // ignore disconnect failures from test doubles or ended nodes
+      }
+    }
+    entry.oscillators.length = 0;
+    for (const gainNode of entry.gains) {
+      try {
+        gainNode.disconnect?.();
+      } catch (_) {
+        // ignore disconnect failures from test doubles or ended nodes
+      }
+    }
+    entry.gains.length = 0;
+  };
+}
+
+function createBrowserAudioRuntime() {
+  const AudioContextCtor = globalThis.AudioContext || globalThis.webkitAudioContext;
+  if (typeof AudioContextCtor !== "function") {
+    return {
+      async play() {
+        return { status: "unsupported", payload: {} };
+      },
+      async stop(channel) {
+        return { status: "unsupported", payload: { channel: String(channel || "") } };
+      },
+    };
+  }
+  let ctx = null;
+  const channels = new Map();
+
+  function ensureCtx() {
+    if (!ctx) ctx = new AudioContextCtor();
+    return ctx;
+  }
+
+  function clearChannel(channel) {
+    const key = String(channel || "");
+    const entry = channels.get(key);
+    if (!entry) return;
+    entry.cleanup();
+    channels.delete(key);
+  }
+
+  function scheduleOneShot(channel, spec) {
+    const audioCtx = ensureCtx();
+    const startedAt = Number(audioCtx.currentTime || 0) + 0.01;
+    const entry = {
+      oscillators: [],
+      gains: [],
+      timeouts: [],
+      cleanup() {},
+    };
+    entry.cleanup = makeAudioCleanup(entry);
+    clearChannel(channel);
+    channels.set(String(channel || ""), entry);
+    const notes = Array.isArray(spec.notes) ? spec.notes : [];
+    const durationSeconds = Math.max(0.04, Number(spec.durationMs || 0) / 1000);
+    const stepSeconds = Math.max(0, Number(spec.stepMs || 0) / 1000);
+    for (let i = 0; i < notes.length; i += 1) {
+      const osc = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      osc.type = String(spec.type || "sine");
+      if (osc.frequency?.setValueAtTime) {
+        osc.frequency.setValueAtTime(Number(notes[i] || 440), startedAt + stepSeconds * i);
+      } else {
+        osc.frequency.value = Number(notes[i] || 440);
+      }
+      const peakGain = Number(spec.gain || 0.02);
+      gainNode.gain?.setValueAtTime?.(0.0001, startedAt + stepSeconds * i);
+      gainNode.gain?.linearRampToValueAtTime?.(peakGain, startedAt + stepSeconds * i + 0.01);
+      gainNode.gain?.exponentialRampToValueAtTime?.(
+        0.0001,
+        startedAt + stepSeconds * i + durationSeconds,
+      );
+      osc.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      osc.start(startedAt + stepSeconds * i);
+      osc.stop(startedAt + stepSeconds * i + durationSeconds);
+      entry.oscillators.push(osc);
+      entry.gains.push(gainNode);
+    }
+    const totalMs =
+      Math.max(1, notes.length) * Number(spec.stepMs || 0) + Number(spec.durationMs || 0) + 60;
+    entry.timeouts.push(
+      setTimeout(() => {
+        clearChannel(channel);
+      }, Math.max(120, totalMs)),
+    );
+  }
+
+  function scheduleLoop(channel, spec) {
+    const audioCtx = ensureCtx();
+    const startedAt = Number(audioCtx.currentTime || 0) + 0.01;
+    const entry = {
+      oscillators: [],
+      gains: [],
+      timeouts: [],
+      cleanup() {},
+    };
+    entry.cleanup = makeAudioCleanup(entry);
+    clearChannel(channel);
+    channels.set(String(channel || ""), entry);
+    const osc = audioCtx.createOscillator();
+    const gainNode = audioCtx.createGain();
+    osc.type = String(spec.type || "sine");
+    if (osc.frequency?.setValueAtTime) {
+      osc.frequency.setValueAtTime(Number(spec.notes?.[0] || 196), startedAt);
+    } else {
+      osc.frequency.value = Number(spec.notes?.[0] || 196);
+    }
+    gainNode.gain?.setValueAtTime?.(0.0001, startedAt);
+    gainNode.gain?.linearRampToValueAtTime?.(Number(spec.gain || 0.018), startedAt + 0.15);
+    osc.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+    osc.start(startedAt);
+    entry.oscillators.push(osc);
+    entry.gains.push(gainNode);
+  }
+
+  return {
+    async play(cue, channel, loop = false) {
+      const spec = audioCueSpec(cue);
+      if (!spec) {
+        return {
+          status: "error",
+          payload: { reason: "invalid_cue", cue: String(cue || "") },
+        };
+      }
+      try {
+        const audioCtx = ensureCtx();
+        if (typeof audioCtx.resume === "function") await audioCtx.resume();
+        if (loop === true || String(cue) === "music_loop") {
+          scheduleLoop(channel, spec);
+        } else {
+          scheduleOneShot(channel, spec);
+        }
+        return {
+          status: "ok",
+          payload: {
+            cue: String(cue || ""),
+            channel: String(channel || ""),
+            loop: loop === true || String(cue) === "music_loop",
+          },
+        };
+      } catch (err) {
+        return {
+          status: browserErrorStatus(err),
+          payload: { message: String(err?.message ?? err), cue: String(cue || "") },
+        };
+      }
+    },
+    async stop(channel) {
+      clearChannel(channel);
+      return {
+        status: "ok",
+        payload: { channel: String(channel || "") },
+      };
+    },
+  };
+}
+
+function createBrowserHapticsRuntime() {
+  return {
+    async trigger(pattern) {
+      const pulse = hapticPatternSpec(pattern);
+      if (!pulse) {
+        return {
+          status: "error",
+          payload: { reason: "invalid_pattern", pattern: String(pattern || "") },
+        };
+      }
+      const vibrate = globalThis.navigator?.vibrate;
+      if (typeof vibrate !== "function") {
+        return { status: "unsupported", payload: {} };
+      }
+      try {
+        const ok = vibrate.call(globalThis.navigator, pulse);
+        return {
+          status: ok === false ? "error" : "ok",
+          payload: { pattern: String(pattern || "") },
+        };
+      } catch (err) {
+        return {
+          status: browserErrorStatus(err),
+          payload: { message: String(err?.message ?? err), pattern: String(pattern || "") },
+        };
+      }
     },
   };
 }
@@ -1882,6 +2146,8 @@ function getCurrentBrowserLocation(timeoutMs) {
 
 function createBrowserNativeHost({ capabilities, dispatchHostEvent, platform = "web" }) {
   const blobStore = createInMemoryBlobStore(capabilities);
+  const audioRuntime = createBrowserAudioRuntime();
+  const hapticsRuntime = createBrowserHapticsRuntime();
   const notifications = new Map();
 
   function clearNotification(id) {
@@ -1939,6 +2205,31 @@ function createBrowserNativeHost({ capabilities, dispatchHostEvent, platform = "
               },
               hostMeta,
             ),
+          };
+        }
+        case "audio": {
+          if (request.op === "audio.stop") {
+            const outcome = await audioRuntime.stop(request.payload.channel);
+            return {
+              family: request.family,
+              result: mkDeviceResult(request, outcome.status, outcome.payload, hostMeta),
+            };
+          }
+          const outcome = await audioRuntime.play(
+            request.payload.cue,
+            request.payload.channel,
+            request.payload.loop === true,
+          );
+          return {
+            family: request.family,
+            result: mkDeviceResult(request, outcome.status, outcome.payload, hostMeta),
+          };
+        }
+        case "haptics": {
+          const outcome = await hapticsRuntime.trigger(request.payload.pattern);
+          return {
+            family: request.family,
+            result: mkDeviceResult(request, outcome.status, outcome.payload, hostMeta),
           };
         }
         case "clipboard": {

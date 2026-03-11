@@ -14,9 +14,9 @@ The [X07 toolchain](https://github.com/x07lang/x07) must be installed before usi
 |---------|-------------|
 | **Host assets** (`crates/x07-device-host-assets/`) | Pinned host bootstrap assets consumed by device bundles (kept in sync with the canonical web host snapshot: `vendor/x07-web-ui/host/host.snapshot.json`) |
 | **Host ABI** (`crates/x07-device-host-abi/`) | Deterministic host ABI hash used by `x07-wasm device` bundles for compatibility verification (snapshot: `arch/host_abi/host_abi.snapshot.json`) |
-| **Desktop runner** (`crates/x07-device-host-desktop/`) | System WebView runner using `tao`/`wry` (macOS, Linux, Windows) with clipboard, single/multi-file import, file save/export, normalized file-drop ingestion, host-owned blob sandbox, local notifications, and deterministic `unsupported` replies where the OS surface is not available |
-| **iOS template** (`mobile/ios/template/`) | WKWebView project template with embedded host assets (store-safe, no remote code loading) plus the native bridge for permissions, camera, clipboard, multi-file selection, file save/export, share, normalized file drop, blobs, foreground location, and local notifications |
-| **Android template** (`mobile/android/template/`) | WebViewAssetLoader project template with embedded host assets (store-safe, no remote code loading) plus the native bridge for permissions, camera, clipboard, multi-file selection, file save/export, share, normalized file drop, blobs, foreground location, and local notifications |
+| **Desktop runner** (`crates/x07-device-host-desktop/`) | System WebView runner using `tao`/`wry` (macOS, Linux, Windows) with clipboard, single/multi-file import, file save/export, normalized file-drop ingestion, host-owned blob sandbox, local notifications, shared-host cue-audio fallback, and deterministic `unsupported` replies where the OS surface is not available |
+| **iOS template** (`mobile/ios/template/`) | WKWebView project template with embedded host assets (store-safe, no remote code loading) plus the native bridge for permissions, camera, clipboard, multi-file selection, file save/export, share, normalized file drop, blobs, foreground location, local notifications, and native haptics |
+| **Android template** (`mobile/android/template/`) | WebViewAssetLoader project template with embedded host assets (store-safe, no remote code loading) plus the native bridge for permissions, camera, clipboard, multi-file selection, file save/export, share, normalized file drop, blobs, foreground location, local notifications, and native haptics |
 
 ## Architecture
 
@@ -49,7 +49,7 @@ x07-device-host-desktop --version
 Fallback:
 
 ```bash
-cargo install --locked x07-device-host-desktop --version 0.2.3
+cargo install --locked x07-device-host-desktop --version 0.2.4
 ```
 
 Use the git install path only when you need unreleased development state from this repo:
@@ -104,6 +104,8 @@ For the current native surface, the host distinguishes build-time capability all
 
 Forge M0 builder-I/O bridge families now use these exact capability names when present in `device.capabilities.json`:
 
+- `audio.playback`
+- `haptics.present`
 - `clipboard.read_text`
 - `clipboard.write_text`
 - `files.pick_multiple`
@@ -112,6 +114,12 @@ Forge M0 builder-I/O bridge families now use these exact capability names when p
 - `share.present`
 
 `files.pick` remains supported as the single-file path. Multi-file picker results and drag/drop events normalize to the same manifest-oriented shape (`files`, `blobs`, `accepted_count`, `rejected_count`, optional `errors`/`partial`), and unsupported targets still return deterministic `unsupported` results instead of ad hoc platform failures.
+
+The current Tactics M0 device UX line adds:
+
+- shared-host cue audio via `audio.playback`, with native hosts allowed to return deterministic `unsupported` so the embedded WebView runtime can synthesize the cue locally
+- native haptics via `haptics.present` on iOS and Android, with deterministic `unsupported` replies on desktop
+- native telemetry names that follow the request op for these surfaces, including `device.audio.play`, `device.audio.stop`, and `device.haptics.trigger`
 
 Native templates now emit the `host.webview_crash` event from the platform WebView crash hooks, and the shared host assets populate the OTLP resource attributes expected by the platform release observability flow:
 

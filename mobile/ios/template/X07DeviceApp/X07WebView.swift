@@ -517,6 +517,8 @@ private struct NativeCapabilities {
       return false
     }
     switch capability {
+    case "audio.playback":
+      return ((device["audio"] as? [String: Any])?["playback"] as? Bool) == true
     case "camera.photo":
       return ((device["camera"] as? [String: Any])?["photo"] as? Bool) == true
     case "clipboard.read_text":
@@ -533,6 +535,8 @@ private struct NativeCapabilities {
       return ((device["files"] as? [String: Any])?["drop"] as? Bool) == true
     case "blob_store":
       return ((device["blob_store"] as? [String: Any])?["enabled"] as? Bool) == true
+    case "haptics.present":
+      return ((device["haptics"] as? [String: Any])?["present"] as? Bool) == true
     case "location.foreground":
       return ((device["location"] as? [String: Any])?["foreground"] as? Bool) == true
     case "notifications.local":
@@ -994,6 +998,14 @@ struct X07WebView: UIViewRepresentable {
       }
 
       switch family {
+      case "audio":
+        let result = handleAudioRequest(request)
+        sendBridgeReply(bridgeRequestId, result: result, webView: webView)
+        emitRequestTelemetry(request: request, status: resultStatus(result), durationMs: Int64(Date().timeIntervalSince(pending.startedAt) * 1000))
+      case "haptics":
+        let result = handleHapticsRequest(request)
+        sendBridgeReply(bridgeRequestId, result: result, webView: webView)
+        emitRequestTelemetry(request: request, status: resultStatus(result), durationMs: Int64(Date().timeIntervalSince(pending.startedAt) * 1000))
       case "permissions":
         handlePermissionsRequest(pending, webView: webView)
       case "camera":
@@ -1024,6 +1036,15 @@ struct X07WebView: UIViewRepresentable {
         sendBridgeReply(bridgeRequestId, result: result, webView: webView)
         emitRequestTelemetry(request: request, status: "unsupported", durationMs: Int64(Date().timeIntervalSince(pending.startedAt) * 1000))
       }
+    }
+
+    private func handleAudioRequest(_ request: [String: Any]) -> [String: Any] {
+      nativeBridgeResult(
+        family: "audio",
+        request: request,
+        status: "unsupported",
+        payload: ["reason": "shared_host_audio"]
+      )
     }
 
     private func handlePermissionsRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
@@ -1473,6 +1494,45 @@ struct X07WebView: UIViewRepresentable {
       )
     }
 
+    private func handleHapticsRequest(_ request: [String: Any]) -> [String: Any] {
+      let payload = request["payload"] as? [String: Any] ?? [:]
+      let pattern = String(describing: payload["pattern"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      switch pattern {
+      case "selection":
+        let generator = UISelectionFeedbackGenerator()
+        generator.prepare()
+        generator.selectionChanged()
+      case "impact":
+        let generator = UIImpactFeedbackGenerator(style: .medium)
+        generator.prepare()
+        generator.impactOccurred()
+      case "victory":
+        let generator = UINotificationFeedbackGenerator()
+        generator.prepare()
+        generator.notificationOccurred(.success)
+      case "defeat":
+        let generator = UINotificationFeedbackGenerator()
+        generator.prepare()
+        generator.notificationOccurred(.error)
+      default:
+        return nativeBridgeResult(
+          family: "haptics",
+          request: request,
+          status: "error",
+          payload: [
+            "reason": "invalid_pattern",
+            "pattern": pattern,
+          ]
+        )
+      }
+      return nativeBridgeResult(
+        family: "haptics",
+        request: request,
+        status: "ok",
+        payload: ["pattern": pattern]
+      )
+    }
+
     private func handleShareRequest(_ request: [String: Any], webView: WKWebView) -> [String: Any] {
       guard let presenter = hostViewController(for: webView) else {
         return nativeBridgeResult(
@@ -1694,7 +1754,7 @@ struct X07WebView: UIViewRepresentable {
     ) {
       telemetry.emitNativeEvent(
         eventClass: eventClass ?? (status == "error" ? "runtime.error" : "bridge.timing"),
-        name: eventName ?? (status == "error" ? "device.op.error" : "device.op.result"),
+        name: eventName ?? requestTelemetryName(request: request, status: status),
         severity: severity ?? (status == "error" ? "error" : "info"),
         attributes: [
           "x07.device.op": String(describing: request["op"] ?? ""),
@@ -1705,6 +1765,19 @@ struct X07WebView: UIViewRepresentable {
           "x07.device.duration_ms": durationMs,
         ]
       )
+    }
+
+    private func requestTelemetryName(request: [String: Any], status: String) -> String {
+      switch String(describing: request["op"] ?? "") {
+      case "audio.play":
+        return "device.audio.play"
+      case "audio.stop":
+        return "device.audio.stop"
+      case "haptics.trigger":
+        return "device.haptics.trigger"
+      default:
+        return status == "error" ? "device.op.error" : "device.op.result"
+      }
     }
 
     private func emitDropEvent(urls: [URL], preloadErrors: [[String: Any]] = []) {

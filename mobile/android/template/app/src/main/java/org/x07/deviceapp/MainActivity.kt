@@ -15,6 +15,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.OpenableColumns
 import android.util.Log
 import android.view.DragEvent
@@ -631,6 +634,7 @@ private class NativeCapabilities private constructor(private val raw: JSONObject
   fun allows(capability: String): Boolean {
     val device = raw.optJSONObject("device") ?: return false
     return when (capability) {
+      "audio.playback" -> device.optJSONObject("audio")?.optBoolean("playback", false) == true
       "camera.photo" -> device.optJSONObject("camera")?.optBoolean("photo", false) == true
       "clipboard.read_text" -> device.optJSONObject("clipboard")?.optBoolean("read_text", false) == true
       "clipboard.write_text" -> device.optJSONObject("clipboard")?.optBoolean("write_text", false) == true
@@ -643,6 +647,7 @@ private class NativeCapabilities private constructor(private val raw: JSONObject
       "files.save" -> device.optJSONObject("files")?.optBoolean("save", false) == true
       "files.drop" -> device.optJSONObject("files")?.optBoolean("drop", false) == true
       "blob_store" -> device.optJSONObject("blob_store")?.optBoolean("enabled", false) == true
+      "haptics.present" -> device.optJSONObject("haptics")?.optBoolean("present", false) == true
       "location.foreground" -> device.optJSONObject("location")?.optBoolean("foreground", false) == true
       "notifications.local" -> device.optJSONObject("notifications")?.optBoolean("local", false) == true
       "share.present" -> device.optJSONObject("share")?.optBoolean("present", false) == true
@@ -995,6 +1000,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     when (family) {
+      "audio" -> {
+        val result = handleAudioRequest(request)
+        sendBridgeReply(bridgeRequestId, result)
+        emitRequestTelemetry(request, resultStatus(result), unixTimeMs() - pending.startedAtMs)
+      }
+      "haptics" -> {
+        val result = handleHapticsRequest(request)
+        sendBridgeReply(bridgeRequestId, result)
+        emitRequestTelemetry(request, resultStatus(result), unixTimeMs() - pending.startedAtMs)
+      }
       "permissions" -> handlePermissionsRequest(pending)
       "camera" -> handleCameraRequest(pending)
       "clipboard" -> handleClipboardRequest(pending)
@@ -1017,6 +1032,15 @@ class MainActivity : AppCompatActivity() {
         emitRequestTelemetry(request, "unsupported", unixTimeMs() - pending.startedAtMs)
       }
     }
+  }
+
+  private fun handleAudioRequest(request: JSONObject): JSONObject {
+    return nativeBridgeResult(
+      family = "audio",
+      request = request,
+      status = "unsupported",
+      payload = JSONObject().put("reason", "shared_host_audio"),
+    )
   }
 
   private fun handlePermissionsRequest(pending: PendingNativeRequest) {
@@ -1882,6 +1906,68 @@ class MainActivity : AppCompatActivity() {
     )
   }
 
+  private fun handleHapticsRequest(request: JSONObject): JSONObject {
+    val pattern = request.optJSONObject("payload")?.optString("pattern", "")?.trim().orEmpty()
+    val timings =
+      when (pattern) {
+        "selection" -> longArrayOf(0, 25)
+        "impact" -> longArrayOf(0, 40)
+        "victory" -> longArrayOf(0, 18, 36, 18)
+        "defeat" -> longArrayOf(0, 45, 24, 55)
+        else -> null
+      }
+    if (timings == null) {
+      return nativeBridgeResult(
+        family = "haptics",
+        request = request,
+        status = "error",
+        payload =
+          JSONObject()
+            .put("reason", "invalid_pattern")
+            .put("pattern", pattern),
+      )
+    }
+    val vibrator = deviceVibrator()
+      ?: return nativeBridgeResult(
+        family = "haptics",
+        request = request,
+        status = "unsupported",
+        payload = JSONObject().put("reason", "vibrator_unavailable"),
+      )
+    if (!vibrator.hasVibrator()) {
+      return nativeBridgeResult(
+        family = "haptics",
+        request = request,
+        status = "unsupported",
+        payload = JSONObject().put("reason", "vibrator_unavailable"),
+      )
+    }
+    return try {
+      if (Build.VERSION.SDK_INT >= 26) {
+        vibrator.vibrate(VibrationEffect.createWaveform(timings, -1))
+      } else {
+        @Suppress("DEPRECATION")
+        vibrator.vibrate(timings, -1)
+      }
+      nativeBridgeResult(
+        family = "haptics",
+        request = request,
+        status = "ok",
+        payload = JSONObject().put("pattern", pattern),
+      )
+    } catch (err: Exception) {
+      nativeBridgeResult(
+        family = "haptics",
+        request = request,
+        status = "error",
+        payload =
+          JSONObject()
+            .put("message", err.message ?: "haptics trigger failed")
+            .put("pattern", pattern),
+      )
+    }
+  }
+
   private fun nativeBridgeResult(
     family: String,
     request: JSONObject,
@@ -1968,10 +2054,28 @@ class MainActivity : AppCompatActivity() {
     }
     telemetry.emitNativeEvent(
       eventClass = eventClass ?: if (status == "error") "runtime.error" else "bridge.timing",
-      name = eventName ?: if (status == "error") "device.op.error" else "device.op.result",
+      name = eventName ?: requestTelemetryName(request, status),
       severity = severity ?: if (status == "error") "error" else "info",
       attributes = attributes,
     )
+  }
+
+  private fun requestTelemetryName(request: JSONObject, status: String): String {
+    return when (request.optString("op", "")) {
+      "audio.play" -> "device.audio.play"
+      "audio.stop" -> "device.audio.stop"
+      "haptics.trigger" -> "device.haptics.trigger"
+      else -> if (status == "error") "device.op.error" else "device.op.result"
+    }
+  }
+
+  private fun deviceVibrator(): Vibrator? {
+    return if (Build.VERSION.SDK_INT >= 31) {
+      getSystemService(VibratorManager::class.java)?.defaultVibrator
+    } else {
+      @Suppress("DEPRECATION")
+      getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+    }
   }
 
   private fun permissionState(permission: String): String {

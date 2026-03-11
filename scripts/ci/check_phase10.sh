@@ -125,12 +125,18 @@ for needle in required_android_telemetry:
         sys.exit(1)
 
 required_android_builder_io = [
+    "audio.playback",
+    "haptics.present",
+    "audio.play",
+    "haptics.trigger",
     "clipboard.read_text",
     "clipboard.write_text",
     "files.pick_multiple",
     "files.save",
     "files.drop",
     "share.present",
+    "VibrationEffect",
+    "VibratorManager",
     "OpenMultipleDocuments",
     "ACTION_CREATE_DOCUMENT",
     "ACTION_SEND",
@@ -159,12 +165,18 @@ for needle in required_ios_telemetry:
         sys.exit(1)
 
 required_ios_builder_io = [
+    "audio.playback",
+    "haptics.present",
+    "audio.play",
+    "haptics.trigger",
     "clipboard.read_text",
     "clipboard.write_text",
     "files.pick_multiple",
     "files.save",
     "files.drop",
     "share.present",
+    "UISelectionFeedbackGenerator",
+    "UINotificationFeedbackGenerator",
     "UIPasteboard.general",
     "UIActivityViewController",
     "UIDropInteraction",
@@ -179,6 +191,10 @@ for needle in required_ios_builder_io:
 desktop_main = root / "crates" / "x07-device-host-desktop" / "src" / "main.rs"
 desktop_main_src = desktop_main.read_text(encoding="utf-8")
 required_desktop_builder_io = [
+    "audio.playback",
+    "haptics.present",
+    "device.audio.play",
+    "device.haptics.trigger",
     "clipboard.read_text",
     "clipboard.write_text",
     "files.pick_multiple",
@@ -240,6 +256,9 @@ for needle in [
     '"bridge.timing"',
     '"policy.violation"',
     '"app.http"',
+    '"x07.web_ui.effect.device.audio.play"',
+    '"x07.web_ui.effect.device.audio.stop"',
+    '"x07.web_ui.effect.device.haptics.trigger"',
     '"x07.web_ui.effect.device.clipboard.read_text"',
     '"x07.web_ui.effect.device.clipboard.copy_text"',
     '"x07.web_ui.effect.device.files.pick"',
