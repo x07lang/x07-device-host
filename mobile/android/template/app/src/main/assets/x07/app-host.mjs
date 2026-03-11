@@ -692,6 +692,10 @@ export const __x07_host_private = {
   normalizeDeviceHostEvent,
   capabilityAllowed,
   mkDeviceResult,
+  createBrowserNativeHost,
+  normalizeDeviceFileItem,
+  streamPayloadToBytes,
+  bytesToStreamPayload,
 };
 
 function setAttrs(el, tag, attrs) {
@@ -1034,11 +1038,12 @@ function streamPayloadToBytes(payload) {
 
 function bytesToStreamPayload(bytes) {
   const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
-  const payload = { bytes_len: u8.length, base64: bytesToBase64(u8) };
+  const payload = { bytes_len: u8.length };
   try {
-    const txt = textDecoderStrict.decode(u8);
-    payload.text = txt;
+    payload.text = textDecoderStrict.decode(u8);
+    return payload;
   } catch (_) {}
+  payload.base64 = bytesToBase64(u8);
   return payload;
 }
 
@@ -1159,14 +1164,26 @@ function capabilityAllowed(capabilities, capability) {
   switch (String(capability || "")) {
     case "camera.photo":
       return device?.camera?.photo === true;
+    case "clipboard.read_text":
+      return device?.clipboard?.read_text === true;
+    case "clipboard.write_text":
+      return device?.clipboard?.write_text === true;
     case "files.pick":
-      return device?.files?.pick === true;
+      return device?.files?.pick === true || device?.files?.pick_multiple === true;
+    case "files.pick_multiple":
+      return device?.files?.pick_multiple === true || device?.files?.pick === true;
+    case "files.save":
+      return device?.files?.save === true;
+    case "files.drop":
+      return device?.files?.drop === true;
     case "blob_store":
       return device?.blob_store?.enabled === true;
     case "location.foreground":
       return device?.location?.foreground === true;
     case "notifications.local":
       return device?.notifications?.local === true;
+    case "share.present":
+      return device?.share?.present === true;
     default:
       return false;
   }
@@ -1194,7 +1211,10 @@ function mkDeviceResult(request, status, payload = {}, hostMeta = {}) {
 
 function normalizeDeviceResult(request, raw, family, platform) {
   const doc = raw && typeof raw === "object" ? raw : {};
-  const payload = doc.payload && typeof doc.payload === "object" && !Array.isArray(doc.payload) ? doc.payload : {};
+  const payload = normalizeDevicePayload(
+    String(doc.family || family || request?.family || ""),
+    doc.payload && typeof doc.payload === "object" && !Array.isArray(doc.payload) ? doc.payload : {},
+  );
   return {
     family: String(doc.family || family || request?.family || ""),
     result: mkDeviceResult(request, doc.status, payload, {
@@ -1214,6 +1234,67 @@ function buildMissingBlobManifest(handle, source = "blob_store") {
     source: String(source || "blob_store"),
     local_state: "missing",
   };
+}
+
+function normalizeBlobManifest(raw, fallbackSource = "files") {
+  const doc = raw && typeof raw === "object" ? raw : {};
+  return {
+    handle: String(doc.handle || ""),
+    sha256: typeof doc.sha256 === "string" ? doc.sha256 : "",
+    mime: String(doc.mime || "application/octet-stream"),
+    byte_size: Number.isFinite(Number(doc.byte_size)) ? Math.max(0, Math.floor(Number(doc.byte_size))) : 0,
+    created_at_ms:
+      Number.isFinite(Number(doc.created_at_ms)) ? Math.max(0, Math.floor(Number(doc.created_at_ms))) : 0,
+    source: String(doc.source || fallbackSource || "files"),
+    local_state: typeof doc.local_state === "string" && doc.local_state ? doc.local_state : "present",
+  };
+}
+
+function normalizeDeviceFileItem(raw, fallbackSource = "files") {
+  const doc = raw && typeof raw === "object" ? raw : {};
+  const looksLikeBlob = typeof doc.handle === "string" && doc.handle.length > 0;
+  const blob =
+    doc.blob && typeof doc.blob === "object"
+      ? normalizeBlobManifest(doc.blob, fallbackSource)
+      : looksLikeBlob
+        ? normalizeBlobManifest(doc, fallbackSource)
+        : null;
+  const item = {
+    name: typeof doc.name === "string" ? doc.name : "",
+    mime: String(doc.mime || blob?.mime || "application/octet-stream"),
+    byte_size:
+      Number.isFinite(Number(doc.byte_size)) && Number(doc.byte_size) >= 0
+        ? Math.floor(Number(doc.byte_size))
+        : Number(blob?.byte_size ?? 0),
+  };
+  if (Number.isFinite(Number(doc.last_modified_ms))) {
+    item.last_modified_ms = Math.max(0, Math.floor(Number(doc.last_modified_ms)));
+  }
+  if (blob) item.blob = blob;
+  return item;
+}
+
+function normalizeDeviceFileItems(rawItems, fallbackSource = "files") {
+  const items = Array.isArray(rawItems) ? rawItems : [];
+  return items
+    .map((item) => normalizeDeviceFileItem(item, fallbackSource))
+    .filter((item) => item.name || item.blob);
+}
+
+function normalizeDevicePayload(family, rawPayload) {
+  const payload =
+    rawPayload && typeof rawPayload === "object" && !Array.isArray(rawPayload) ? { ...rawPayload } : {};
+  if (family !== "files") {
+    return payload;
+  }
+  if (!Array.isArray(payload.items) && !Array.isArray(payload.blobs)) {
+    return payload;
+  }
+  const rawItems = Array.isArray(payload.items) ? payload.items : payload.blobs;
+  const items = normalizeDeviceFileItems(rawItems, String(payload.source || "files"));
+  payload.items = items;
+  payload.blobs = items.map((item) => item.blob).filter(Boolean);
+  return payload;
 }
 
 function normalizePermissionState(raw) {
@@ -1236,7 +1317,16 @@ function normalizeDeviceHostEvent(raw) {
   const doc = raw && typeof raw === "object" ? raw : {};
   const type = String(doc.type ?? "");
   if (!type) throw new Error("device host event missing type");
-  return { ...doc, type };
+  if (type !== "files.drop") {
+    return { ...doc, type };
+  }
+  const rawItems = Array.isArray(doc.items) ? doc.items : Array.isArray(doc.blobs) ? doc.blobs : [];
+  const target = typeof doc.target === "string" ? doc.target : "";
+  return {
+    type,
+    target,
+    items: normalizeDeviceFileItems(rawItems, "files.drop"),
+  };
 }
 
 function parseCommonDeviceRequest(effect, expectedKind, family, expectedOp, fallbackCapability = "") {
@@ -1303,13 +1393,71 @@ function parseDeviceCameraEffect(effect) {
   );
 }
 
+function parseDeviceClipboardEffect(effect) {
+  return (
+    parseCommonDeviceRequest(
+      effect,
+      "x07.web_ui.effect.device.clipboard.copy_text",
+      "clipboard",
+      "clipboard.write_text",
+      "clipboard.write_text",
+    ) ||
+    parseCommonDeviceRequest(
+      effect,
+      "x07.web_ui.effect.device.clipboard.read_text",
+      "clipboard",
+      "clipboard.read_text",
+      "clipboard.read_text",
+    )
+  );
+}
+
 function parseDeviceFilesEffect(effect) {
-  return parseCommonDeviceRequest(
+  const pick = parseCommonDeviceRequest(
     effect,
     "x07.web_ui.effect.device.files.pick",
     "files",
     "files.pick",
     "files.pick",
+  );
+  if (pick) {
+    pick.capability = pick.payload?.multiple === true ? "files.pick_multiple" : "files.pick";
+    return pick;
+  }
+  return (
+    parseCommonDeviceRequest(
+      effect,
+      "x07.web_ui.effect.device.files.save_text",
+      "files",
+      "files.save",
+      "files.save",
+    ) ||
+    parseCommonDeviceRequest(
+      effect,
+      "x07.web_ui.effect.device.files.save_json",
+      "files",
+      "files.save",
+      "files.save",
+    )
+  );
+}
+
+function parseDeviceShareEffect(effect) {
+  return (
+    parseCommonDeviceRequest(
+      effect,
+      "x07.web_ui.effect.device.share.share_text",
+      "share",
+      "share.present",
+      "share.present",
+    ) ||
+    parseCommonDeviceRequest(
+      effect,
+      "x07.web_ui.effect.device.share.share_files",
+      "share",
+      "share.present",
+      "share.present",
+    )
   );
 }
 
@@ -1367,12 +1515,14 @@ function parseAnyDeviceEffect(effect) {
   return (
     parseDevicePermissionsEffect(effect) ||
     parseDeviceCameraEffect(effect) ||
+    parseDeviceClipboardEffect(effect) ||
     parseDeviceFilesEffect(effect) ||
     parseDeviceBlobsStatEffect(effect) ||
     parseDeviceBlobsDeleteEffect(effect) ||
     parseDeviceLocationEffect(effect) ||
     parseDeviceNotificationsScheduleEffect(effect) ||
-    parseDeviceNotificationsCancelEffect(effect)
+    parseDeviceNotificationsCancelEffect(effect) ||
+    parseDeviceShareEffect(effect)
   );
 }
 
@@ -1419,6 +1569,9 @@ function createInMemoryBlobStore(capabilities) {
       totalBytes += u8.length;
       return manifest;
     },
+    get(handle) {
+      return items.get(String(handle || "")) || null;
+    },
     stat(handle) {
       const item = items.get(String(handle || ""));
       return item ? item.manifest : buildMissingBlobManifest(handle);
@@ -1441,13 +1594,14 @@ async function readFileBytes(file) {
   return new Uint8Array(await file.arrayBuffer());
 }
 
-function promptBrowserFile({ accept = "", capture = "" } = {}) {
-  if (!globalThis.document?.createElement) return Promise.resolve({ status: "unsupported", file: null });
+function promptBrowserFiles({ accept = "", capture = "", multiple = false } = {}) {
+  if (!globalThis.document?.createElement) return Promise.resolve({ status: "unsupported", files: [] });
   return new Promise((resolve) => {
     const input = document.createElement("input");
     input.type = "file";
     if (accept) input.setAttribute("accept", accept);
     if (capture) input.setAttribute("capture", capture);
+    input.multiple = multiple === true;
     input.style.display = "none";
     document.body?.appendChild?.(input);
     let settled = false;
@@ -1455,22 +1609,180 @@ function promptBrowserFile({ accept = "", capture = "" } = {}) {
       input.remove?.();
       globalThis.removeEventListener?.("focus", onFocus, true);
     };
-    const finish = (status, file = null) => {
+    const finish = (status, files = []) => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve({ status, file });
+      resolve({ status, files });
     };
     const onFocus = () => {
-      globalThis.setTimeout?.(() => finish("cancelled", null), 0);
+      globalThis.setTimeout?.(() => finish("cancelled", []), 0);
     };
     input.addEventListener("change", () => {
-      const file = input.files?.[0] ?? null;
-      finish(file ? "ok" : "cancelled", file);
+      const files = Array.from(input.files || []).filter(Boolean);
+      finish(files.length > 0 ? "ok" : "cancelled", files);
     });
     globalThis.addEventListener?.("focus", onFocus, true);
     input.click();
   });
+}
+
+async function promptBrowserFile(options = {}) {
+  const pick = await promptBrowserFiles({ ...options, multiple: false });
+  return {
+    status: pick.status,
+    file: pick.files?.[0] ?? null,
+  };
+}
+
+function browserErrorStatus(err) {
+  const name = String(err?.name ?? "");
+  if (name === "AbortError") return "cancelled";
+  if (name === "NotAllowedError" || name === "SecurityError") return "denied";
+  return "error";
+}
+
+function buildStoredDeviceFileItem(file, manifest) {
+  const item = {
+    name: typeof file?.name === "string" ? file.name : "",
+    mime: String(file?.type || manifest?.mime || "application/octet-stream"),
+    byte_size:
+      Number.isFinite(Number(file?.size)) && Number(file?.size) >= 0
+        ? Math.floor(Number(file.size))
+        : Number(manifest?.byte_size ?? 0),
+    blob: normalizeBlobManifest(manifest, String(manifest?.source || "files")),
+  };
+  if (Number.isFinite(Number(file?.lastModified))) {
+    item.last_modified_ms = Math.max(0, Math.floor(Number(file.lastModified)));
+  }
+  return item;
+}
+
+async function createDeviceFileItemsFromFiles(files, blobStore, source = "files") {
+  const items = [];
+  for (const file of Array.isArray(files) ? files : []) {
+    const bytes = await readFileBytes(file);
+    const manifest = await blobStore.put(bytes, {
+      mime: file?.type || "application/octet-stream",
+      source,
+    });
+    items.push(buildStoredDeviceFileItem(file, manifest));
+  }
+  return items;
+}
+
+function buildFilesPayload(items, extra = {}) {
+  return {
+    ...extra,
+    items,
+    blobs: items.map((item) => item.blob).filter(Boolean),
+  };
+}
+
+function buildSaveFileRequest(request) {
+  const payload = request?.payload && typeof request.payload === "object" ? request.payload : {};
+  if (request?.kind === "x07.web_ui.effect.device.files.save_json") {
+    const value = "value" in payload ? payload.value : "json" in payload ? payload.json : null;
+    return {
+      name: String(payload.name || payload.filename || "export.json"),
+      mime: String(payload.mime || "application/json"),
+      bytes: textEncoder.encode(`${JSON.stringify(value ?? null, null, 2)}\n`),
+    };
+  }
+  return {
+    name: String(payload.name || payload.filename || "export.txt"),
+    mime: String(payload.mime || "text/plain;charset=utf-8"),
+    bytes: textEncoder.encode(String(payload.text ?? "")),
+  };
+}
+
+async function saveBrowserFile({ name, mime, bytes }) {
+  if (typeof globalThis.showSaveFilePicker === "function") {
+    try {
+      const handle = await globalThis.showSaveFilePicker({ suggestedName: name });
+      const writable = await handle.createWritable();
+      await writable.write(bytes);
+      await writable.close();
+      return { status: "ok" };
+    } catch (err) {
+      return { status: browserErrorStatus(err), error: err };
+    }
+  }
+  if (!globalThis.document?.createElement || !globalThis.URL?.createObjectURL) {
+    return { status: "unsupported" };
+  }
+  try {
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    globalThis.setTimeout?.(() => URL.revokeObjectURL(url), 1000);
+    return { status: "ok" };
+  } catch (err) {
+    return { status: "error", error: err };
+  }
+}
+
+function buildSavedFileItem({ name, mime, bytes }) {
+  return {
+    name: String(name || ""),
+    mime: String(mime || "application/octet-stream"),
+    byte_size: bytes instanceof Uint8Array ? bytes.length : new Uint8Array(bytes || []).length,
+  };
+}
+
+function shareFilesPayloadItems(payload) {
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.blobs)) return payload.blobs;
+  return [];
+}
+
+function resolveShareFiles(payload, blobStore) {
+  if (typeof globalThis.File !== "function") {
+    const err = new Error("File constructor is unavailable");
+    err.code = "unsupported";
+    throw err;
+  }
+  const items = normalizeDeviceFileItems(shareFilesPayloadItems(payload), "share.present");
+  const files = [];
+  const normalizedItems = [];
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i];
+    const handle = String(item?.blob?.handle || "");
+    if (!handle) {
+      throw new Error("share file item missing blob.handle");
+    }
+    const stored = blobStore.get(handle);
+    if (!stored) {
+      throw new Error(`share file blob handle is not present: ${handle}`);
+    }
+    const name = item.name || `file-${i + 1}`;
+    const mime = String(item.mime || stored.manifest.mime || "application/octet-stream");
+    files.push(
+      new globalThis.File([stored.bytes], name, {
+        type: mime,
+        lastModified: Number(item.last_modified_ms ?? stored.manifest.created_at_ms ?? Date.now()),
+      }),
+    );
+    normalizedItems.push({
+      ...item,
+      name,
+      mime,
+      byte_size: Number(item.byte_size || stored.manifest.byte_size),
+      blob: normalizeBlobManifest(stored.manifest, "share.present"),
+    });
+  }
+  return { files, items: normalizedItems };
+}
+
+async function buildFilesDropEvent(target, rawFiles, blobStore) {
+  return {
+    type: "files.drop",
+    target: String(target || ""),
+    items: await createDeviceFileItemsFromFiles(Array.from(rawFiles || []).filter(Boolean), blobStore, "files.drop"),
+  };
 }
 
 async function queryBrowserPermissionState(permission) {
@@ -1583,6 +1895,9 @@ function createBrowserNativeHost({ capabilities, dispatchHostEvent, platform = "
 
   return {
     mode: "browser",
+    async dispatchFilesDrop(target, rawFiles) {
+      return dispatchHostEvent(await buildFilesDropEvent(target, rawFiles, blobStore));
+    },
     async invoke(request) {
       const hostMeta = deviceHostMeta(platform);
       switch (request.family) {
@@ -1626,23 +1941,121 @@ function createBrowserNativeHost({ capabilities, dispatchHostEvent, platform = "
             ),
           };
         }
+        case "clipboard": {
+          const clipboard = globalThis.navigator?.clipboard;
+          if (request.op === "clipboard.read_text") {
+            if (!clipboard || typeof clipboard.readText !== "function") {
+              return { family: request.family, result: mkDeviceResult(request, "unsupported", {}, hostMeta) };
+            }
+            try {
+              const text = await clipboard.readText();
+              return {
+                family: request.family,
+                result: mkDeviceResult(request, "ok", { text: String(text ?? "") }, hostMeta),
+              };
+            } catch (err) {
+              return {
+                family: request.family,
+                result: mkDeviceResult(request, browserErrorStatus(err), {}, hostMeta),
+              };
+            }
+          }
+          if (!clipboard || typeof clipboard.writeText !== "function") {
+            return { family: request.family, result: mkDeviceResult(request, "unsupported", {}, hostMeta) };
+          }
+          try {
+            const text = String(request.payload.text ?? "");
+            await clipboard.writeText(text);
+            return {
+              family: request.family,
+              result: mkDeviceResult(request, "ok", { text_len: text.length }, hostMeta),
+            };
+          } catch (err) {
+            return {
+              family: request.family,
+              result: mkDeviceResult(request, browserErrorStatus(err), {}, hostMeta),
+            };
+          }
+        }
         case "files": {
+          if (request.op === "files.save") {
+            const saveRequest = buildSaveFileRequest(request);
+            const outcome = await saveBrowserFile(saveRequest);
+            return {
+              family: request.family,
+              result: mkDeviceResult(
+                request,
+                outcome.status,
+                outcome.status === "ok"
+                  ? buildFilesPayload([buildSavedFileItem(saveRequest)])
+                  : {},
+                hostMeta,
+              ),
+            };
+          }
           const accept = Array.isArray(request.payload.accept)
             ? request.payload.accept.map((item) => String(item || "")).filter(Boolean).join(",")
             : "";
-          const pick = await promptBrowserFile({ accept });
-          if (pick.status !== "ok" || !pick.file) {
+          const multiple = request.payload?.multiple === true;
+          const pick = await promptBrowserFiles({ accept, multiple });
+          if (pick.status !== "ok" || !Array.isArray(pick.files) || pick.files.length === 0) {
             return { family: request.family, result: mkDeviceResult(request, pick.status, {}, hostMeta) };
           }
-          const bytes = await readFileBytes(pick.file);
-          const manifest = await blobStore.put(bytes, {
-            mime: pick.file.type || "application/octet-stream",
-            source: "files",
-          });
+          const items = await createDeviceFileItemsFromFiles(pick.files, blobStore, "files.pick");
           return {
             family: request.family,
-            result: mkDeviceResult(request, "ok", { blobs: [manifest] }, hostMeta),
+            result: mkDeviceResult(request, "ok", buildFilesPayload(items, { multiple }), hostMeta),
           };
+        }
+        case "share": {
+          const share = globalThis.navigator?.share;
+          if (typeof share !== "function") {
+            return { family: request.family, result: mkDeviceResult(request, "unsupported", {}, hostMeta) };
+          }
+          const payload = request.payload && typeof request.payload === "object" ? request.payload : {};
+          const title = typeof payload.title === "string" ? payload.title : undefined;
+          const text = typeof payload.text === "string" ? payload.text : undefined;
+          const url = typeof payload.url === "string" ? payload.url : undefined;
+          try {
+            if (request.kind === "x07.web_ui.effect.device.share.share_files") {
+              const { files, items } = resolveShareFiles(payload, blobStore);
+              if (files.length === 0) {
+                return {
+                  family: request.family,
+                  result: mkDeviceResult(
+                    request,
+                    "error",
+                    { message: "share_files requires at least one item" },
+                    hostMeta,
+                  ),
+                };
+              }
+              if (
+                typeof globalThis.navigator?.canShare === "function" &&
+                !globalThis.navigator.canShare({ files })
+              ) {
+                return { family: request.family, result: mkDeviceResult(request, "unsupported", {}, hostMeta) };
+              }
+              await share.call(globalThis.navigator, { title, text, url, files });
+              return {
+                family: request.family,
+                result: mkDeviceResult(request, "ok", { items }, hostMeta),
+              };
+            }
+            await share.call(globalThis.navigator, { title, text, url });
+            return {
+              family: request.family,
+              result: mkDeviceResult(request, "ok", {}, hostMeta),
+            };
+          } catch (err) {
+            if (err?.code === "unsupported") {
+              return { family: request.family, result: mkDeviceResult(request, "unsupported", {}, hostMeta) };
+            }
+            return {
+              family: request.family,
+              result: mkDeviceResult(request, browserErrorStatus(err), {}, hostMeta),
+            };
+          }
         }
         case "blobs": {
           const handle = String(request.payload.handle || "");
@@ -2411,6 +2824,35 @@ export async function mountWebUiApp({
       void dispatch({ type: "submit", target }).catch((err) =>
         reportDispatchError("submit", err, { target }),
       );
+    },
+    true,
+  );
+  root.addEventListener(
+    "dragover",
+    (ev) => {
+      const el = ev?.target?.closest?.("[data-x07-key]");
+      const target = el?.dataset?.x07Key || "";
+      if (!target) return;
+      const allowed = allowedEvents.get(target);
+      if (!(allowed?.has("files.drop") ?? false) && !(allowed?.has("drop") ?? false)) return;
+      if (!capabilityAllowed(capabilities, "files.drop")) return;
+      ev.preventDefault();
+    },
+    true,
+  );
+  root.addEventListener(
+    "drop",
+    (ev) => {
+      const el = ev?.target?.closest?.("[data-x07-key]");
+      const target = el?.dataset?.x07Key || "";
+      if (!target) return;
+      const allowed = allowedEvents.get(target);
+      if (!(allowed?.has("files.drop") ?? false) && !(allowed?.has("drop") ?? false)) return;
+      if (!capabilityAllowed(capabilities, "files.drop")) return;
+      ev.preventDefault();
+      void browserNativeHost
+        .dispatchFilesDrop(target, ev?.dataTransfer?.files || [])
+        .catch((err) => reportDispatchError("files.drop", err, { target }));
     },
     true,
   );

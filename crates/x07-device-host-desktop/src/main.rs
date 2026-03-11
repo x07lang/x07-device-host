@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use arboard::Clipboard;
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -102,6 +103,7 @@ enum UserEvent {
     UiError,
     Timeout,
     DispatchScript(String),
+    FlushDroppedFiles(u64),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,10 +208,17 @@ struct BlobSandboxError {
     message: String,
 }
 
+#[derive(Debug, Default)]
+struct PendingDropBatch {
+    seq: u64,
+    paths: Vec<PathBuf>,
+}
+
 struct DesktopNativeRuntime {
     capabilities: Value,
     blob_sandbox: BlobSandbox,
     notifications: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    drop_batch: Mutex<PendingDropBatch>,
     proxy: EventLoopProxy<UserEvent>,
     telemetry: Arc<telemetry::TelemetryCoordinator>,
 }
@@ -226,6 +235,7 @@ impl DesktopNativeRuntime {
             capabilities,
             blob_sandbox,
             notifications: Mutex::new(BTreeMap::new()),
+            drop_batch: Mutex::new(PendingDropBatch::default()),
             proxy,
             telemetry,
         })
@@ -266,15 +276,14 @@ impl DesktopNativeRuntime {
 
         let reply = match family.as_str() {
             "permissions" => self.handle_permissions_request(request),
+            "clipboard" => self.handle_clipboard_request(request),
             "files" => self.handle_files_request(request),
             "blobs" => self.handle_blobs_request(request),
             "notifications" => self.handle_notifications_request(request),
+            "share" => self.handle_share_request(request),
             _ => json!({
                 "family": family,
-                "result": desktop_result_doc(request, "unsupported", json!({}), json!({
-                    "platform": "desktop",
-                    "provider": "desktop_native",
-                })),
+                "result": desktop_result_doc(request, "unsupported", json!({}), desktop_host_meta()),
             }),
         };
         let status = reply
@@ -303,7 +312,99 @@ impl DesktopNativeRuntime {
         reply
     }
 
+    fn handle_clipboard_request(&self, request: &Value) -> Value {
+        let mut clipboard = match Clipboard::new() {
+            Ok(value) => value,
+            Err(err) => {
+                return json!({
+                    "family": "clipboard",
+                    "result": desktop_result_doc(
+                        request,
+                        "unsupported",
+                        json!({
+                            "reason": "clipboard_unavailable",
+                            "message": err.to_string(),
+                        }),
+                        desktop_host_meta(),
+                    ),
+                });
+            }
+        };
+
+        if request.get("op").and_then(Value::as_str) == Some("clipboard.read_text") {
+            return match clipboard.get_text() {
+                Ok(text) => json!({
+                    "family": "clipboard",
+                    "result": desktop_result_doc(
+                        request,
+                        "ok",
+                        json!({ "text": text }),
+                        desktop_host_meta(),
+                    ),
+                }),
+                Err(err) => json!({
+                    "family": "clipboard",
+                    "result": desktop_result_doc(
+                        request,
+                        "error",
+                        json!({ "message": err.to_string() }),
+                        desktop_host_meta(),
+                    ),
+                }),
+            };
+        }
+
+        let text = request
+            .pointer("/payload/text")
+            .and_then(Value::as_str)
+            .or_else(|| request.pointer("/payload/value").and_then(Value::as_str))
+            .or_else(|| {
+                request
+                    .pointer("/payload/body/text")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("")
+            .to_string();
+
+        match clipboard.set_text(text.clone()) {
+            Ok(()) => json!({
+                "family": "clipboard",
+                "result": desktop_result_doc(
+                    request,
+                    "ok",
+                    json!({ "text_bytes_len": text.as_bytes().len() }),
+                    desktop_host_meta(),
+                ),
+            }),
+            Err(err) => json!({
+                "family": "clipboard",
+                "result": desktop_result_doc(
+                    request,
+                    "error",
+                    json!({ "message": err.to_string() }),
+                    desktop_host_meta(),
+                ),
+            }),
+        }
+    }
+
     fn handle_files_request(&self, request: &Value) -> Value {
+        let multiple = request
+            .pointer("/payload/multiple")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match request
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("files.pick")
+        {
+            "files.save" => self.handle_files_save_request(request),
+            "files.pick_multiple" => self.handle_files_pick_request(request, true),
+            _ => self.handle_files_pick_request(request, multiple),
+        }
+    }
+
+    fn handle_files_pick_request(&self, request: &Value, multiple: bool) -> Value {
         if !desktop_capability_allowed(&self.capabilities, "blob_store") {
             return json!({
                 "family": "files",
@@ -311,80 +412,213 @@ impl DesktopNativeRuntime {
                     request,
                     "unsupported",
                     json!({ "reason": "blob_store_disabled" }),
-                    json!({
-                        "platform": "desktop",
-                        "provider": "desktop_native",
-                    }),
+                    desktop_host_meta(),
                 ),
             });
         }
 
         let accepts = desktop_request_accepts(request, &self.capabilities);
-        let Some(path) = desktop_pick_file(&accepts) else {
-            return json!({
-                "family": "files",
-                "result": desktop_result_doc(
-                    request,
-                    "cancelled",
-                    json!({}),
-                    json!({
-                        "platform": "desktop",
-                        "provider": "desktop_native",
-                    }),
-                ),
-            });
+        let paths = if multiple {
+            let Some(paths) = desktop_pick_files(&accepts) else {
+                return json!({
+                    "family": "files",
+                    "result": desktop_result_doc(request, "cancelled", json!({}), desktop_host_meta()),
+                });
+            };
+            paths
+        } else {
+            let Some(path) = desktop_pick_file(&accepts) else {
+                return json!({
+                    "family": "files",
+                    "result": desktop_result_doc(request, "cancelled", json!({}), desktop_host_meta()),
+                });
+            };
+            vec![path]
         };
 
-        match fs::read(&path) {
-            Ok(bytes) => {
-                match self
-                    .blob_sandbox
-                    .put(&bytes, &desktop_mime_type_for_path(&path), "files")
-                {
-                    Ok(manifest) => json!({
-                        "family": "files",
-                        "result": desktop_result_doc(
-                            request,
-                            "ok",
-                            json!({
-                                "blobs": [manifest_value(&manifest)],
-                                "path": path.display().to_string(),
-                            }),
-                            json!({
-                                "platform": "desktop",
-                                "provider": "desktop_native",
-                            }),
-                        ),
-                    }),
-                    Err(err) => json!({
+        let (payload, status) = self.import_file_paths(&paths, "files.pick");
+        json!({
+            "family": "files",
+            "result": desktop_result_doc(request, status, payload, desktop_host_meta()),
+        })
+    }
+
+    fn import_file_paths(&self, paths: &[PathBuf], source: &str) -> (Value, &'static str) {
+        let mut files = Vec::new();
+        let mut blobs = Vec::new();
+        let mut errors = Vec::new();
+
+        for path in paths {
+            match fs::read(path) {
+                Ok(bytes) => {
+                    match self
+                        .blob_sandbox
+                        .put(&bytes, &desktop_mime_type_for_path(path), source)
+                    {
+                        Ok(manifest) => {
+                            blobs.push(manifest_value(&manifest));
+                            files.push(desktop_file_value(&manifest, Some(path), source));
+                        }
+                        Err(err) => errors.push(json!({
+                            "code": err.code,
+                            "message": err.message,
+                            "path": path.display().to_string(),
+                        })),
+                    }
+                }
+                Err(err) => errors.push(json!({
+                    "code": "file_read_failed",
+                    "message": format!("failed to read file {}: {err}", path.display()),
+                    "path": path.display().to_string(),
+                })),
+            }
+        }
+
+        let mut payload = json!({
+            "blobs": blobs,
+            "files": files,
+            "accepted_count": files.len(),
+            "rejected_count": errors.len(),
+        });
+        if let Some(obj) = payload.as_object_mut() {
+            if paths.len() == 1 {
+                obj.insert(
+                    "path".to_string(),
+                    Value::String(paths[0].display().to_string()),
+                );
+            }
+            if !errors.is_empty() {
+                obj.insert("errors".to_string(), Value::Array(errors));
+                if !files.is_empty() {
+                    obj.insert("partial".to_string(), Value::Bool(true));
+                }
+            }
+        }
+        let status = if files.is_empty() { "error" } else { "ok" };
+        (payload, status)
+    }
+
+    fn handle_files_save_request(&self, request: &Value) -> Value {
+        let request_kind = request
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let default_filename = if request_kind == "x07.web_ui.effect.device.files.save_json" {
+            "export.json"
+        } else {
+            "export.txt"
+        };
+        let default_mime = if request_kind == "x07.web_ui.effect.device.files.save_json" {
+            "application/json"
+        } else {
+            "text/plain;charset=utf-8"
+        };
+        let filename = request
+            .pointer("/payload/filename")
+            .and_then(Value::as_str)
+            .or_else(|| request.pointer("/payload/name").and_then(Value::as_str))
+            .or_else(|| {
+                request
+                    .pointer("/payload/suggested_name")
+                    .and_then(Value::as_str)
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_filename);
+        let mime = request
+            .pointer("/payload/mime")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                request
+                    .pointer("/payload/content_type")
+                    .and_then(Value::as_str)
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_mime);
+        let bytes = if let Some(handle) = request
+            .pointer("/payload/blob_handle")
+            .and_then(Value::as_str)
+            .or_else(|| request.pointer("/payload/handle").and_then(Value::as_str))
+            .filter(|value| !value.is_empty())
+        {
+            match self.blob_sandbox.read(handle) {
+                Ok((manifest, bytes)) => (manifest.mime, bytes),
+                Err(err) => {
+                    return json!({
                         "family": "files",
                         "result": desktop_result_doc(
                             request,
                             "error",
-                            json!({
-                                "reason": err.code,
-                                "message": err.message,
-                            }),
-                            json!({
-                                "platform": "desktop",
-                                "provider": "desktop_native",
-                            }),
+                            json!({ "message": format!("{err:#}") }),
+                            desktop_host_meta(),
                         ),
-                    }),
+                    });
                 }
             }
+        } else if request_kind == "x07.web_ui.effect.device.files.save_json" {
+            let value = request
+                .pointer("/payload/value")
+                .cloned()
+                .or_else(|| request.pointer("/payload/json").cloned())
+                .unwrap_or(Value::Null);
+            let mut text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string());
+            text.push('\n');
+            (mime.to_string(), text.into_bytes())
+        } else if let Some(text) = request
+            .pointer("/payload/text")
+            .and_then(Value::as_str)
+            .or_else(|| request.pointer("/payload/value").and_then(Value::as_str))
+            .or_else(|| {
+                request
+                    .pointer("/payload/body/text")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| request.pointer("/payload/url").and_then(Value::as_str))
+            .or_else(|| request.pointer("/payload/href").and_then(Value::as_str))
+        {
+            (mime.to_string(), text.as_bytes().to_vec())
+        } else {
+            return json!({
+                "family": "files",
+                "result": desktop_result_doc(
+                    request,
+                    "error",
+                    json!({ "reason": "invalid_request", "message": "request payload missing text/url/blob_handle" }),
+                    desktop_host_meta(),
+                ),
+            });
+        };
+
+        let Some(path) = desktop_save_file(filename) else {
+            return json!({
+                "family": "files",
+                "result": desktop_result_doc(request, "cancelled", json!({}), desktop_host_meta()),
+            });
+        };
+
+        match fs::write(&path, &bytes.1) {
+            Ok(()) => json!({
+                "family": "files",
+                "result": desktop_result_doc(
+                    request,
+                    "ok",
+                    json!({
+                        "filename": filename,
+                        "mime": bytes.0,
+                        "bytes_len": bytes.1.len(),
+                        "path": path.display().to_string(),
+                    }),
+                    desktop_host_meta(),
+                ),
+            }),
             Err(err) => json!({
                 "family": "files",
                 "result": desktop_result_doc(
                     request,
                     "error",
                     json!({
-                        "message": format!("failed to read file {}: {err}", path.display()),
+                        "message": format!("failed to write file {}: {err}", path.display()),
                     }),
-                    json!({
-                        "platform": "desktop",
-                        "provider": "desktop_native",
-                    }),
+                    desktop_host_meta(),
                 ),
             }),
         }
@@ -546,6 +780,92 @@ impl DesktopNativeRuntime {
             let _ = proxy.send_event(UserEvent::DispatchScript(bridge_event_script(&doc)));
         });
     }
+
+    fn handle_share_request(&self, request: &Value) -> Value {
+        json!({
+            "family": "share",
+            "result": desktop_result_doc(
+                request,
+                "unsupported",
+                json!({ "reason": "share_not_supported_on_desktop" }),
+                desktop_host_meta(),
+            ),
+        })
+    }
+
+    fn queue_dropped_file(&self, path: PathBuf) {
+        if !desktop_capability_allowed(&self.capabilities, "files.drop")
+            || !desktop_capability_allowed(&self.capabilities, "blob_store")
+        {
+            return;
+        }
+        let seq = {
+            let mut batch = self.drop_batch.lock().expect("lock desktop drop batch");
+            batch.seq = batch.seq.saturating_add(1);
+            batch.paths.push(path);
+            batch.seq
+        };
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            let _ = proxy.send_event(UserEvent::FlushDroppedFiles(seq));
+        });
+    }
+
+    fn flush_dropped_files(&self, seq: u64) -> Option<Value> {
+        let paths = {
+            let mut batch = self.drop_batch.lock().expect("lock desktop drop batch");
+            if batch.seq != seq || batch.paths.is_empty() {
+                return None;
+            }
+            std::mem::take(&mut batch.paths)
+        };
+        let started = Instant::now();
+        let (payload, status) = self.import_file_paths(&paths, "files.drop");
+        let accepted_count = payload
+            .get("accepted_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let rejected_count = payload
+            .get("rejected_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        self.telemetry.emit_native_event(
+            "bridge.timing",
+            "device.files.drop",
+            if status == "error" { "error" } else { "info" },
+            desktop_device_telemetry_attrs(
+                &json!({
+                    "op": "files.drop",
+                    "request_id": "",
+                    "capability": "files.drop",
+                }),
+                status,
+                started.elapsed().as_millis() as u64,
+                [
+                    (
+                        "x07.device.accepted_count",
+                        Value::Number(accepted_count.into()),
+                    ),
+                    (
+                        "x07.device.rejected_count",
+                        Value::Number(rejected_count.into()),
+                    ),
+                ],
+            ),
+        );
+        Some(json!({
+            "type": "files.drop",
+            "status": status,
+            "source": "desktop",
+            "accepted_count": accepted_count,
+            "rejected_count": rejected_count,
+            "files": payload.get("files").cloned().unwrap_or_else(|| json!([])),
+            "blobs": payload.get("blobs").cloned().unwrap_or_else(|| json!([])),
+            "errors": payload.get("errors").cloned().unwrap_or_else(|| json!([])),
+            "partial": payload.get("partial").cloned().unwrap_or(Value::Bool(false)),
+        }))
+    }
 }
 
 impl BlobSandbox {
@@ -653,6 +973,18 @@ impl BlobSandbox {
             manifest.local_state = "missing".to_string();
         }
         Ok(manifest)
+    }
+
+    fn read(&self, handle: &str) -> Result<(BlobManifestDoc, Vec<u8>)> {
+        let Some(sha256) = blob_sha_from_handle(handle) else {
+            anyhow::bail!("invalid blob handle: {handle}");
+        };
+        let Some(manifest) = self.read_manifest(sha256)? else {
+            anyhow::bail!("missing blob manifest: {handle}");
+        };
+        let path = self.blob_path(sha256);
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        Ok((manifest, bytes))
     }
 
     fn delete(&self, handle: &str) -> Result<BlobManifestDoc> {
@@ -1122,6 +1454,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
     let ipc_run_state = run_state.clone();
     let ipc_telemetry = telemetry.clone();
     let ipc_native_runtime = native_runtime.clone();
+    let event_loop_native_runtime = native_runtime.clone();
     let webview = WebViewBuilder::new()
         .with_custom_protocol("x07".to_string(), move |_id, request| {
             handle_custom_protocol(protocol_state.clone(), request)
@@ -1147,6 +1480,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         run_state.clone(),
         args.headless_smoke,
         webview_slot,
+        event_loop_native_runtime,
     );
 
     let final_state = run_state.lock().expect("lock run_state");
@@ -1198,6 +1532,7 @@ fn run_event_loop(
     run_state: Arc<Mutex<RunState>>,
     headless_smoke: bool,
     webview: Rc<RefCell<Option<wry::WebView>>>,
+    native_runtime: Arc<DesktopNativeRuntime>,
 ) {
     use tao::platform::run_return::EventLoopExtRunReturn as _;
 
@@ -1210,6 +1545,10 @@ fn run_event_loop(
                 event: WindowEvent::CloseRequested,
                 ..
             } => *control_flow = ControlFlow::Exit,
+            Event::WindowEvent {
+                event: WindowEvent::DroppedFile(path),
+                ..
+            } => native_runtime.queue_dropped_file(path),
             Event::UserEvent(UserEvent::UiReady) if headless_smoke => {
                 *control_flow = ControlFlow::Exit
             }
@@ -1227,6 +1566,13 @@ fn run_event_loop(
                     let _ = webview.evaluate_script(&script);
                 }
             }
+            Event::UserEvent(UserEvent::FlushDroppedFiles(seq)) => {
+                if let Some(doc) = native_runtime.flush_dropped_files(seq) {
+                    if let Some(webview) = webview.borrow().as_ref() {
+                        let _ = webview.evaluate_script(&bridge_event_script(&doc));
+                    }
+                }
+            }
             _ => {}
         }
     });
@@ -1238,6 +1584,7 @@ fn run_event_loop(
     _run_state: Arc<Mutex<RunState>>,
     _headless_smoke: bool,
     _webview: Rc<RefCell<Option<wry::WebView>>>,
+    _native_runtime: Arc<DesktopNativeRuntime>,
 ) {
     unreachable!("unsupported platform for x07-device-host-desktop");
 }
@@ -1530,9 +1877,44 @@ fn desktop_capability_allowed(capabilities: &Value, capability: &str) -> bool {
             .and_then(|value| value.get("photo"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "clipboard.read_text" => device
+            .and_then(|value| value.get("clipboard"))
+            .and_then(|value| value.get("read_text"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "clipboard.write_text" => device
+            .and_then(|value| value.get("clipboard"))
+            .and_then(|value| value.get("write_text"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         "files.pick" => device
             .and_then(|value| value.get("files"))
             .and_then(|value| value.get("pick"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || device
+                .and_then(|value| value.get("files"))
+                .and_then(|value| value.get("pick_multiple"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        "files.pick_multiple" => device
+            .and_then(|value| value.get("files"))
+            .and_then(|value| value.get("pick_multiple"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || device
+                .and_then(|value| value.get("files"))
+                .and_then(|value| value.get("pick"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        "files.save" => device
+            .and_then(|value| value.get("files"))
+            .and_then(|value| value.get("save"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "files.drop" => device
+            .and_then(|value| value.get("files"))
+            .and_then(|value| value.get("drop"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
         "blob_store" => device
@@ -1550,6 +1932,11 @@ fn desktop_capability_allowed(capabilities: &Value, capability: &str) -> bool {
             .and_then(|value| value.get("local"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "share.present" => device
+            .and_then(|value| value.get("share"))
+            .and_then(|value| value.get("present"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -1562,6 +1949,13 @@ fn desktop_result_doc(request: &Value, status: &str, payload: Value, host_meta: 
         "status": status,
         "payload": payload,
         "host_meta": host_meta,
+    })
+}
+
+fn desktop_host_meta() -> Value {
+    json!({
+        "platform": "desktop",
+        "provider": "desktop_native",
     })
 }
 
@@ -1606,6 +2000,21 @@ fn missing_blob_manifest(handle: &str, source: &str) -> BlobManifestDoc {
 
 fn manifest_value(manifest: &BlobManifestDoc) -> Value {
     serde_json::to_value(manifest).unwrap_or_else(|_| json!({}))
+}
+
+fn desktop_file_value(manifest: &BlobManifestDoc, path: Option<&Path>, source: &str) -> Value {
+    json!({
+        "name": path
+            .and_then(|value| value.file_name())
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        "path": path.map(|value| value.display().to_string()).unwrap_or_default(),
+        "mime": manifest.mime,
+        "byte_size": manifest.byte_size,
+        "last_modified_ms": 0_u64,
+        "source": source,
+        "blob": manifest_value(manifest),
+    })
 }
 
 fn desktop_request_accepts(request: &Value, capabilities: &Value) -> Vec<String> {
@@ -1668,6 +2077,47 @@ fn desktop_pick_file(accepts: &[String]) -> Option<PathBuf> {
     }
     let _ = has_filter;
     dialog.pick_file()
+}
+
+fn desktop_pick_files(accepts: &[String]) -> Option<Vec<PathBuf>> {
+    let mut dialog = rfd::FileDialog::new().set_title("Pick files for x07");
+    let mut has_filter = false;
+    if accepts
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case("image/*"))
+    {
+        dialog = dialog.add_filter(
+            "Images",
+            &["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif"],
+        );
+        has_filter = true;
+    }
+    if accepts
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case("application/pdf"))
+    {
+        dialog = dialog.add_filter("PDF", &["pdf"]);
+        has_filter = true;
+    }
+    let ext_filters = accepts
+        .iter()
+        .filter_map(|item| item.strip_prefix('.'))
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>();
+    if !ext_filters.is_empty() {
+        let ext_slices = ext_filters.iter().map(String::as_str).collect::<Vec<_>>();
+        dialog = dialog.add_filter("Files", &ext_slices);
+        has_filter = true;
+    }
+    let _ = has_filter;
+    dialog.pick_files()
+}
+
+fn desktop_save_file(filename: &str) -> Option<PathBuf> {
+    let dialog = rfd::FileDialog::new()
+        .set_title("Save file for x07")
+        .set_file_name(filename);
+    dialog.save_file()
 }
 
 fn desktop_mime_type_for_path(path: &Path) -> String {
@@ -1970,6 +2420,10 @@ mod tests {
         assert_eq!(stat.handle, manifest.handle);
         assert_eq!(stat.local_state, "present");
 
+        let (read_manifest, read_bytes) = sandbox.read(&manifest.handle).expect("read blob");
+        assert_eq!(read_manifest.handle, manifest.handle);
+        assert_eq!(read_bytes, b"hello");
+
         let deleted = sandbox.delete(&manifest.handle).expect("delete blob");
         assert_eq!(deleted.local_state, "deleted");
 
@@ -2031,5 +2485,42 @@ mod tests {
         assert_eq!(err.code, "blob_total_too_large");
 
         let _ = fs::remove_dir_all(bundle_dir);
+    }
+
+    #[test]
+    fn desktop_capability_allowed_recognizes_builder_io_flags() {
+        let capabilities = json!({
+            "device": {
+                "clipboard": {
+                    "read_text": true,
+                    "write_text": true
+                },
+                "files": {
+                    "pick": true,
+                    "pick_multiple": true,
+                    "save": true,
+                    "drop": true
+                },
+                "share": {
+                    "present": true
+                }
+            }
+        });
+
+        assert!(desktop_capability_allowed(
+            &capabilities,
+            "clipboard.read_text"
+        ));
+        assert!(desktop_capability_allowed(
+            &capabilities,
+            "clipboard.write_text"
+        ));
+        assert!(desktop_capability_allowed(
+            &capabilities,
+            "files.pick_multiple"
+        ));
+        assert!(desktop_capability_allowed(&capabilities, "files.save"));
+        assert!(desktop_capability_allowed(&capabilities, "files.drop"));
+        assert!(desktop_capability_allowed(&capabilities, "share.present"));
     }
 }

@@ -1,7 +1,11 @@
 package org.x07.deviceapp
 
 import android.Manifest
+import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.location.Location
@@ -11,7 +15,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.util.Log
+import android.view.DragEvent
 import android.webkit.JavascriptInterface
 import android.webkit.MimeTypeMap
 import android.webkit.RenderProcessGoneDetail
@@ -559,6 +565,14 @@ private data class PendingPermissionRequest(
   val request: PendingNativeRequest,
 )
 
+private data class ExportPayload(
+  val filename: String,
+  val mime: String,
+  val bytes: ByteArray,
+  val text: String,
+  val url: String,
+)
+
 private data class BlobManifestDoc(
   val handle: String,
   val sha256: String,
@@ -618,10 +632,20 @@ private class NativeCapabilities private constructor(private val raw: JSONObject
     val device = raw.optJSONObject("device") ?: return false
     return when (capability) {
       "camera.photo" -> device.optJSONObject("camera")?.optBoolean("photo", false) == true
-      "files.pick" -> device.optJSONObject("files")?.optBoolean("pick", false) == true
+      "clipboard.read_text" -> device.optJSONObject("clipboard")?.optBoolean("read_text", false) == true
+      "clipboard.write_text" -> device.optJSONObject("clipboard")?.optBoolean("write_text", false) == true
+      "files.pick" ->
+        device.optJSONObject("files")?.optBoolean("pick", false) == true ||
+          device.optJSONObject("files")?.optBoolean("pick_multiple", false) == true
+      "files.pick_multiple" ->
+        device.optJSONObject("files")?.optBoolean("pick_multiple", false) == true ||
+          device.optJSONObject("files")?.optBoolean("pick", false) == true
+      "files.save" -> device.optJSONObject("files")?.optBoolean("save", false) == true
+      "files.drop" -> device.optJSONObject("files")?.optBoolean("drop", false) == true
       "blob_store" -> device.optJSONObject("blob_store")?.optBoolean("enabled", false) == true
       "location.foreground" -> device.optJSONObject("location")?.optBoolean("foreground", false) == true
       "notifications.local" -> device.optJSONObject("notifications")?.optBoolean("local", false) == true
+      "share.present" -> device.optJSONObject("share")?.optBoolean("present", false) == true
       else -> false
     }
   }
@@ -736,6 +760,20 @@ private class NativeBlobStore(
     }
   }
 
+  fun read(handle: String): Pair<BlobManifestDoc, ByteArray> {
+    val sha256 = blobSha(handle) ?: throw NativeBlobStoreError("blob_io_error", "invalid blob handle")
+    val manifest = readManifest(sha256) ?: throw NativeBlobStoreError("blob_io_error", "missing blob manifest")
+    val path = blobPath(sha256)
+    if (!path.isFile) {
+      throw NativeBlobStoreError("blob_io_error", "missing blob payload")
+    }
+    return try {
+      manifest to path.readBytes()
+    } catch (err: Exception) {
+      throw NativeBlobStoreError("blob_io_error", err.message ?: "blob read failed")
+    }
+  }
+
   private fun totalPresentBytes(): Long {
     val files = metaDir.listFiles() ?: return 0L
     var total = 0L
@@ -813,6 +851,22 @@ private fun missingBlobManifest(
   )
 }
 
+private fun fileEntryJson(
+  manifest: BlobManifestDoc,
+  name: String,
+  path: String = "",
+  source: String,
+): JSONObject {
+  return JSONObject()
+    .put("name", name)
+    .put("path", path)
+    .put("mime", manifest.mime)
+    .put("byte_size", manifest.byteSize)
+    .put("last_modified_ms", 0L)
+    .put("source", source)
+    .put("blob", manifest.toJson())
+}
+
 private fun stringsFromJsonArray(values: JSONArray?): List<String> {
   if (values == null) return emptyList()
   val out = mutableListOf<String>()
@@ -886,12 +940,17 @@ class MainActivity : AppCompatActivity() {
   private val capabilities by lazy { NativeCapabilities.loadFromAssets(this) }
   private val nativePrefs by lazy { getSharedPreferences("x07.device.host", MODE_PRIVATE) }
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val ioExecutor = Executors.newSingleThreadExecutor()
   private val scheduledNotifications = linkedMapOf<String, Runnable>()
   private var blobStore: NativeBlobStore? = null
   private var pendingPermissionRequest: PendingPermissionRequest? = null
   private var pendingCameraRequest: PendingNativeRequest? = null
   private var pendingCameraCompressionQuality = jpegCompressionQuality("medium")
   private var pendingFileRequest: PendingNativeRequest? = null
+  private var pendingFileSaveRequest: PendingNativeRequest? = null
+  private var pendingFileSaveBytes: ByteArray? = null
+  private var pendingFileSaveMime = "application/octet-stream"
+  private var pendingFileSaveFilename = "export.txt"
   private var pendingLocationRequest: PendingNativeRequest? = null
   private var pendingLocationTimeout: Runnable? = null
   private var pendingLocationCancellation: CancellationSignal? = null
@@ -906,6 +965,14 @@ class MainActivity : AppCompatActivity() {
   private val filePickerLauncher =
     registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
       finishFilePick(uri)
+    }
+  private val filePickerMultipleLauncher =
+    registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+      finishFilePickMultiple(uris)
+    }
+  private val createDocumentLauncher =
+    registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+      finishFileSave(result.resultCode, result.data?.data)
     }
 
   internal fun handleNativeRequest(doc: JSONObject) {
@@ -930,11 +997,17 @@ class MainActivity : AppCompatActivity() {
     when (family) {
       "permissions" -> handlePermissionsRequest(pending)
       "camera" -> handleCameraRequest(pending)
+      "clipboard" -> handleClipboardRequest(pending)
       "files" -> handleFilesRequest(pending)
       "blobs" -> handleBlobsRequest(pending)
       "location" -> handleLocationRequest(pending)
       "notifications" -> {
         val result = handleNotificationsRequest(request)
+        sendBridgeReply(bridgeRequestId, result)
+        emitRequestTelemetry(request, resultStatus(result), unixTimeMs() - pending.startedAtMs)
+      }
+      "share" -> {
+        val result = handleShareRequest(request)
         sendBridgeReply(bridgeRequestId, result)
         emitRequestTelemetry(request, resultStatus(result), unixTimeMs() - pending.startedAtMs)
       }
@@ -1067,6 +1140,58 @@ class MainActivity : AppCompatActivity() {
     )
   }
 
+  private fun handleClipboardRequest(pending: PendingNativeRequest) {
+    val clipboard = getSystemService(ClipboardManager::class.java)
+    if (clipboard == null) {
+      completeRequest(
+        pending = pending,
+        status = "unsupported",
+        payload = JSONObject().put("reason", "clipboard_unavailable"),
+      )
+      return
+    }
+    val op = pending.request.optString("op", "")
+    if (op == "clipboard.read_text") {
+      val text =
+        clipboard.primaryClip
+          ?.takeIf { it.itemCount > 0 }
+          ?.getItemAt(0)
+          ?.coerceToText(this)
+          ?.toString()
+          ?: ""
+      completeRequest(
+        pending = pending,
+        status = "ok",
+        payload = JSONObject().put("text", text),
+      )
+      return
+    }
+
+    val payload = pending.request.optJSONObject("payload") ?: JSONObject()
+    val text =
+      when {
+        payload.has("text") -> payload.optString("text", "")
+        payload.has("value") -> payload.optString("value", "")
+        payload.optJSONObject("body")?.has("text") == true ->
+          payload.optJSONObject("body")?.optString("text", "").orEmpty()
+        else -> ""
+      }
+    try {
+      clipboard.setPrimaryClip(ClipData.newPlainText("x07", text))
+      completeRequest(
+        pending = pending,
+        status = "ok",
+        payload = JSONObject().put("text_bytes_len", text.toByteArray(Charsets.UTF_8).size),
+      )
+    } catch (err: Exception) {
+      completeRequest(
+        pending = pending,
+        status = "error",
+        payload = JSONObject().put("message", err.message ?: "clipboard write failed"),
+      )
+    }
+  }
+
   private fun handleCameraRequest(pending: PendingNativeRequest) {
     val activeBlobStore = blobStore
     if (activeBlobStore == null) {
@@ -1157,6 +1282,18 @@ class MainActivity : AppCompatActivity() {
   }
 
   private fun handleFilesRequest(pending: PendingNativeRequest) {
+    val payload = pending.request.optJSONObject("payload") ?: JSONObject()
+    when (pending.request.optString("op", "files.pick")) {
+      "files.save" -> handleFileSaveRequest(pending)
+      "files.pick_multiple" -> handleFilePickRequest(pending, multiple = true)
+      else -> handleFilePickRequest(pending, multiple = payload.optBoolean("multiple", false))
+    }
+  }
+
+  private fun handleFilePickRequest(
+    pending: PendingNativeRequest,
+    multiple: Boolean,
+  ) {
     if (blobStore == null) {
       completeRequest(
         pending = pending,
@@ -1174,61 +1311,274 @@ class MainActivity : AppCompatActivity() {
       return
     }
     val payload = pending.request.optJSONObject("payload") ?: JSONObject()
-    if (payload.optBoolean("multiple", false)) {
-      completeRequest(
-        pending = pending,
-        status = "unsupported",
-        payload = JSONObject().put("reason", "multiple_not_supported"),
-      )
-      return
-    }
     val accepts = stringsFromJsonArray(payload.optJSONArray("accept")).ifEmpty { capabilities.fileAcceptDefaults() }
     pendingFileRequest = pending
-    filePickerLauncher.launch(acceptMimeTypes(accepts))
+    if (multiple) {
+      filePickerMultipleLauncher.launch(acceptMimeTypes(accepts))
+    } else {
+      filePickerLauncher.launch(acceptMimeTypes(accepts))
+    }
   }
 
   private fun finishFilePick(uri: Uri?) {
     val pending = pendingFileRequest ?: return
     pendingFileRequest = null
-    val activeBlobStore = blobStore
     if (uri == null) {
       completeRequest(pending = pending, status = "cancelled", payload = JSONObject())
       return
     }
-    if (activeBlobStore == null) {
+    val (status, payload) = importUris(listOf(uri), "files.pick")
+    completeRequest(pending = pending, status = status, payload = payload)
+  }
+
+  private fun finishFilePickMultiple(uris: List<Uri>) {
+    val pending = pendingFileRequest ?: return
+    pendingFileRequest = null
+    if (uris.isEmpty()) {
+      completeRequest(pending = pending, status = "cancelled", payload = JSONObject())
+      return
+    }
+    val (status, payload) = importUris(uris, "files.pick")
+    completeRequest(pending = pending, status = status, payload = payload)
+  }
+
+  private fun handleFileSaveRequest(pending: PendingNativeRequest) {
+    if (pendingFileSaveRequest != null) {
       completeRequest(
         pending = pending,
-        status = "unsupported",
-        payload = JSONObject().put("reason", "blob_store_disabled"),
+        status = "error",
+        payload = JSONObject().put("message", "file save already in flight"),
+      )
+      return
+    }
+    val payload = pending.request.optJSONObject("payload") ?: JSONObject()
+    val export =
+      try {
+        resolveExportPayload(pending.request.optString("kind", ""), payload)
+      } catch (err: NativeBlobStoreError) {
+        completeRequest(
+          pending = pending,
+          status = "error",
+          payload = JSONObject().put("reason", err.codeName).put("message", err.message),
+        )
+        return
+      } catch (err: Exception) {
+        completeRequest(
+          pending = pending,
+          status = "error",
+          payload = JSONObject().put("reason", "invalid_request").put("message", err.message ?: "invalid export payload"),
+        )
+        return
+      }
+    pendingFileSaveRequest = pending
+    pendingFileSaveBytes = export.bytes
+    pendingFileSaveMime = export.mime
+    pendingFileSaveFilename = export.filename
+    val intent =
+      Intent(Intent.ACTION_CREATE_DOCUMENT)
+        .addCategory(Intent.CATEGORY_OPENABLE)
+        .setType(export.mime)
+        .putExtra(Intent.EXTRA_TITLE, export.filename)
+    createDocumentLauncher.launch(intent)
+  }
+
+  private fun finishFileSave(
+    resultCode: Int,
+    uri: Uri?,
+  ) {
+    val pending = pendingFileSaveRequest ?: return
+    val bytes = pendingFileSaveBytes
+    val mime = pendingFileSaveMime
+    val filename = pendingFileSaveFilename
+    pendingFileSaveRequest = null
+    pendingFileSaveBytes = null
+    pendingFileSaveMime = "application/octet-stream"
+    pendingFileSaveFilename = "export.txt"
+    if (resultCode != Activity.RESULT_OK || uri == null) {
+      completeRequest(pending = pending, status = "cancelled", payload = JSONObject())
+      return
+    }
+    if (bytes == null) {
+      completeRequest(
+        pending = pending,
+        status = "error",
+        payload = JSONObject().put("message", "file save payload missing"),
       )
       return
     }
     try {
-      val bytes =
-        contentResolver.openInputStream(uri)?.use { input -> input.readBytes() }
-          ?: throw FileNotFoundException("unable to open selected file")
-      val manifest = activeBlobStore.put(bytes, mimeTypeForUri(this, uri), "files")
+      contentResolver.openOutputStream(uri)?.use { output ->
+        output.write(bytes)
+      } ?: throw FileNotFoundException("unable to open export destination")
       completeRequest(
         pending = pending,
         status = "ok",
-        payload = JSONObject().put("blobs", JSONArray().put(manifest.toJson())),
-      )
-    } catch (err: NativeBlobStoreError) {
-      completeRequest(
-        pending = pending,
-        status = "error",
         payload =
           JSONObject()
-            .put("reason", err.codeName)
-            .put("message", err.message),
+            .put("filename", filename)
+            .put("mime", mime)
+            .put("bytes_len", bytes.size)
+            .put("path", uri.toString()),
       )
     } catch (err: Exception) {
       completeRequest(
         pending = pending,
         status = "error",
-        payload = JSONObject().put("message", err.message ?: "file import failed"),
+        payload = JSONObject().put("message", err.message ?: "file export failed"),
       )
     }
+  }
+
+  private fun importUris(
+    uris: List<Uri>,
+    source: String,
+  ): Pair<String, JSONObject> {
+    val activeBlobStore = blobStore ?: return "unsupported" to JSONObject().put("reason", "blob_store_disabled")
+    val blobs = JSONArray()
+    val files = JSONArray()
+    val errors = JSONArray()
+    for (uri in uris) {
+      try {
+        val bytes =
+          contentResolver.openInputStream(uri)?.use { input -> input.readBytes() }
+            ?: throw FileNotFoundException("unable to open selected file")
+        val manifest = activeBlobStore.put(bytes, mimeTypeForUri(this, uri), source)
+        blobs.put(manifest.toJson())
+        files.put(
+          fileEntryJson(
+            manifest = manifest,
+            name = displayNameForUri(uri),
+            path = uri.toString(),
+            source = source,
+          ),
+        )
+      } catch (err: NativeBlobStoreError) {
+        errors.put(
+          JSONObject()
+            .put("code", err.codeName)
+            .put("message", err.message)
+            .put("path", uri.toString()),
+        )
+      } catch (err: Exception) {
+        errors.put(
+          JSONObject()
+            .put("code", "file_import_failed")
+            .put("message", err.message ?: "file import failed")
+            .put("path", uri.toString()),
+        )
+      }
+    }
+    val payload =
+      JSONObject()
+        .put("blobs", blobs)
+        .put("files", files)
+        .put("accepted_count", files.length())
+        .put("rejected_count", errors.length())
+    if (uris.size == 1) {
+      payload.put("path", uris.first().toString())
+    }
+    if (errors.length() > 0) {
+      payload.put("errors", errors)
+      if (files.length() > 0) {
+        payload.put("partial", true)
+      }
+    }
+    return if (files.length() > 0) "ok" to payload else "error" to payload
+  }
+
+  private fun displayNameForUri(uri: Uri): String {
+    val cursor =
+      try {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+      } catch (_: Exception) {
+        null
+      }
+    cursor?.use {
+      if (it.moveToFirst()) {
+        val idx = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (idx >= 0) {
+          val name = it.getString(idx)
+          if (!name.isNullOrBlank()) {
+            return name
+          }
+        }
+      }
+    }
+    return uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+  }
+
+  private fun jsonValueToPrettyString(value: Any?): String =
+    when (value) {
+      null, JSONObject.NULL -> "null"
+      is JSONObject -> value.toString(2)
+      is JSONArray -> value.toString(2)
+      is String -> JSONObject.quote(value)
+      is Number, is Boolean -> value.toString()
+      else -> jsonValueToPrettyString(JSONObject.wrap(value))
+    }
+
+  private fun resolveExportPayload(
+    kind: String,
+    payload: JSONObject,
+  ): ExportPayload {
+    val defaultFilename = if (kind == "x07.web_ui.effect.device.files.save_json") "export.json" else "export.txt"
+    val defaultMime = if (kind == "x07.web_ui.effect.device.files.save_json") "application/json" else "text/plain;charset=utf-8"
+    val filename =
+      payload.optString(
+        "filename",
+        payload.optString("name", payload.optString("suggested_name", defaultFilename)),
+      ).ifBlank { defaultFilename }
+    val requestMime =
+      payload.optString("mime", payload.optString("content_type", defaultMime))
+        .ifBlank { defaultMime }
+    val blobHandle = payload.optString("blob_handle", payload.optString("handle", "")).trim()
+    if (blobHandle.isNotEmpty()) {
+      val activeBlobStore = blobStore ?: throw NativeBlobStoreError("blob_io_error", "blob store unavailable")
+      val (manifest, bytes) = activeBlobStore.read(blobHandle)
+      return ExportPayload(
+        filename = filename,
+        mime = manifest.mime.ifBlank { requestMime },
+        bytes = bytes,
+        text = "",
+        url = "",
+      )
+    }
+    if (kind == "x07.web_ui.effect.device.files.save_json") {
+      val jsonValue =
+        when {
+          payload.has("value") -> payload.get("value")
+          payload.has("json") -> payload.get("json")
+          else -> JSONObject.NULL
+        }
+      val body = "${jsonValueToPrettyString(jsonValue)}\n"
+      return ExportPayload(
+        filename = filename,
+        mime = requestMime,
+        bytes = body.toByteArray(Charsets.UTF_8),
+        text = body,
+        url = "",
+      )
+    }
+    val text =
+      when {
+        payload.has("text") -> payload.optString("text", "")
+        payload.has("value") -> payload.optString("value", "")
+        payload.optJSONObject("body")?.has("text") == true ->
+          payload.optJSONObject("body")?.optString("text", "").orEmpty()
+        else -> ""
+      }
+    val url = payload.optString("url", payload.optString("href", ""))
+    val body = if (text.isNotEmpty()) text else url
+    if (body.isEmpty()) {
+      throw IllegalArgumentException("request payload missing text/url/blob_handle")
+    }
+    return ExportPayload(
+      filename = filename,
+      mime = requestMime,
+      bytes = body.toByteArray(Charsets.UTF_8),
+      text = text,
+      url = url,
+    )
   }
 
   private fun handleBlobsRequest(pending: PendingNativeRequest) {
@@ -1364,6 +1714,133 @@ class MainActivity : AppCompatActivity() {
     pendingLocationCancellation?.cancel()
     pendingLocationCancellation = null
     pendingLocationRequest = null
+  }
+
+  private fun handleShareRequest(request: JSONObject): JSONObject {
+    val payload = request.optJSONObject("payload") ?: JSONObject()
+    if (request.optString("kind", "") == "x07.web_ui.effect.device.share.share_files") {
+      return nativeBridgeResult(
+        family = "share",
+        request = request,
+        status = "unsupported",
+        payload = JSONObject().put("reason", "share_blob_not_supported"),
+      )
+    }
+    val export =
+      try {
+        resolveExportPayload(request.optString("kind", ""), payload)
+      } catch (err: NativeBlobStoreError) {
+        return nativeBridgeResult(
+          family = "share",
+          request = request,
+          status = "unsupported",
+          payload = JSONObject().put("reason", err.codeName).put("message", err.message),
+        )
+      } catch (err: Exception) {
+        return nativeBridgeResult(
+          family = "share",
+          request = request,
+          status = "error",
+          payload = JSONObject().put("reason", "invalid_request").put("message", err.message ?: "invalid share payload"),
+        )
+      }
+
+    if (export.text.isEmpty() && export.url.isEmpty()) {
+      return nativeBridgeResult(
+        family = "share",
+        request = request,
+        status = "unsupported",
+        payload = JSONObject().put("reason", "share_blob_not_supported"),
+      )
+    }
+
+    val shareBody =
+      buildString {
+        if (export.text.isNotEmpty()) append(export.text)
+        if (export.url.isNotEmpty()) {
+          if (isNotEmpty()) append('\n')
+          append(export.url)
+        }
+      }
+    return try {
+      val intent =
+        Intent(Intent.ACTION_SEND)
+          .setType("text/plain")
+          .putExtra(Intent.EXTRA_TEXT, shareBody)
+      payload.optString("title", payload.optString("subject", ""))
+        .takeIf { it.isNotBlank() }
+        ?.let { intent.putExtra(Intent.EXTRA_SUBJECT, it) }
+      startActivity(Intent.createChooser(intent, payload.optString("title", "Share")))
+      nativeBridgeResult(
+        family = "share",
+        request = request,
+        status = "ok",
+        payload =
+          JSONObject()
+            .put("text_bytes_len", shareBody.toByteArray(Charsets.UTF_8).size)
+            .put("shared", true),
+      )
+    } catch (err: Exception) {
+      nativeBridgeResult(
+        family = "share",
+        request = request,
+        status = "unsupported",
+        payload = JSONObject().put("message", err.message ?: "share unavailable"),
+      )
+    }
+  }
+
+  private fun handleDroppedClipData(clipData: ClipData?) {
+    if (!capabilities.allows("files.drop") || !capabilities.allows("blob_store")) {
+      return
+    }
+    val uris = mutableListOf<Uri>()
+    val itemCount = clipData?.itemCount ?: 0
+    for (i in 0 until itemCount) {
+      clipData?.getItemAt(i)?.uri?.let(uris::add)
+    }
+    if (uris.isEmpty()) {
+      return
+    }
+    val startedAtMs = unixTimeMs()
+    ioExecutor.execute {
+      val (status, payload) = importUris(uris, "files.drop")
+      telemetry.emitNativeEvent(
+        eventClass = if (status == "error") "runtime.error" else "bridge.timing",
+        name = "device.files.drop",
+        severity = if (status == "error") "error" else "info",
+        attributes =
+          mapOf(
+            "x07.device.op" to "files.drop",
+            "x07.device.request_id" to "",
+            "x07.device.status" to status,
+            "x07.device.capability" to "files.drop",
+            "x07.device.platform" to "android",
+            "x07.device.duration_ms" to (unixTimeMs() - startedAtMs),
+            "x07.device.accepted_count" to payload.optInt("accepted_count", 0),
+            "x07.device.rejected_count" to payload.optInt("rejected_count", 0),
+          ),
+        body = payload.optJSONArray("errors")?.toString(),
+      )
+      val event =
+        JSONObject()
+          .put("type", "files.drop")
+          .put("status", status)
+          .put("source", "android")
+          .put("files", payload.optJSONArray("files") ?: JSONArray())
+          .put("blobs", payload.optJSONArray("blobs") ?: JSONArray())
+          .put("accepted_count", payload.optInt("accepted_count", 0))
+          .put("rejected_count", payload.optInt("rejected_count", 0))
+      if (payload.has("errors")) {
+        event.put("errors", payload.optJSONArray("errors"))
+      }
+      if (payload.optBoolean("partial", false)) {
+        event.put("partial", true)
+      }
+      mainHandler.post {
+        sendBridgePayload("__x07DispatchDeviceEvent", event)
+      }
+    }
   }
 
   private fun handleNotificationsRequest(request: JSONObject): JSONObject {
@@ -1593,6 +2070,16 @@ class MainActivity : AppCompatActivity() {
     webView.settings.allowFileAccessFromFileURLs = false
     webView.settings.allowUniversalAccessFromFileURLs = false
     webView.addJavascriptInterface(X07IpcBridge(this, telemetry), "ipc")
+    webView.setOnDragListener { _, event ->
+      when (event.action) {
+        DragEvent.ACTION_DRAG_STARTED -> capabilities.allows("files.drop")
+        DragEvent.ACTION_DROP -> {
+          handleDroppedClipData(event.clipData)
+          true
+        }
+        else -> event.clipData?.itemCount?.let { it >= 0 } ?: false
+      }
+    }
 
     val assetLoader = WebViewAssetLoader.Builder()
       .addPathHandler("/assets/", X07AssetsPathHandler(this))
@@ -1653,5 +2140,6 @@ class MainActivity : AppCompatActivity() {
     }
     scheduledNotifications.clear()
     clearLocationRequest()
+    ioExecutor.shutdownNow()
   }
 }

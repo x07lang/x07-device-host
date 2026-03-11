@@ -124,6 +124,24 @@ for needle in required_android_telemetry:
         print(main_activity, file=sys.stderr)
         sys.exit(1)
 
+required_android_builder_io = [
+    "clipboard.read_text",
+    "clipboard.write_text",
+    "files.pick_multiple",
+    "files.save",
+    "files.drop",
+    "share.present",
+    "OpenMultipleDocuments",
+    "ACTION_CREATE_DOCUMENT",
+    "ACTION_SEND",
+    "setOnDragListener",
+]
+for needle in required_android_builder_io:
+    if needle not in main_activity_src:
+        print(f"android template MainActivity missing builder-I/O hook: {needle}", file=sys.stderr)
+        print(main_activity, file=sys.stderr)
+        sys.exit(1)
+
 ios_webview = root / "mobile" / "ios" / "template" / "X07DeviceApp" / "X07WebView.swift"
 ios_webview_src = ios_webview.read_text(encoding="utf-8")
 required_ios_telemetry = [
@@ -138,6 +156,44 @@ for needle in required_ios_telemetry:
     if needle not in ios_webview_src:
         print(f"ios template X07WebView missing telemetry hook: {needle}", file=sys.stderr)
         print(ios_webview, file=sys.stderr)
+        sys.exit(1)
+
+required_ios_builder_io = [
+    "clipboard.read_text",
+    "clipboard.write_text",
+    "files.pick_multiple",
+    "files.save",
+    "files.drop",
+    "share.present",
+    "UIPasteboard.general",
+    "UIActivityViewController",
+    "UIDropInteraction",
+    "forExporting:",
+]
+for needle in required_ios_builder_io:
+    if needle not in ios_webview_src:
+        print(f"ios template X07WebView missing builder-I/O hook: {needle}", file=sys.stderr)
+        print(ios_webview, file=sys.stderr)
+        sys.exit(1)
+
+desktop_main = root / "crates" / "x07-device-host-desktop" / "src" / "main.rs"
+desktop_main_src = desktop_main.read_text(encoding="utf-8")
+required_desktop_builder_io = [
+    "clipboard.read_text",
+    "clipboard.write_text",
+    "files.pick_multiple",
+    "files.save",
+    "files.drop",
+    "share.present",
+    "Clipboard::new",
+    "pick_files",
+    "save_file",
+    "WindowEvent::DroppedFile",
+]
+for needle in required_desktop_builder_io:
+    if needle not in desktop_main_src:
+        print(f"desktop main.rs missing builder-I/O hook: {needle}", file=sys.stderr)
+        print(desktop_main, file=sys.stderr)
         sys.exit(1)
 
 ios_plist = root / "mobile" / "ios" / "template" / "X07DeviceApp" / "Info.plist"
@@ -184,6 +240,14 @@ for needle in [
     '"bridge.timing"',
     '"policy.violation"',
     '"app.http"',
+    '"x07.web_ui.effect.device.clipboard.read_text"',
+    '"x07.web_ui.effect.device.clipboard.copy_text"',
+    '"x07.web_ui.effect.device.files.pick"',
+    '"x07.web_ui.effect.device.files.save_text"',
+    '"x07.web_ui.effect.device.files.save_json"',
+    '"x07.web_ui.effect.device.share.share_text"',
+    '"x07.web_ui.effect.device.share.share_files"',
+    '"files.drop"',
 ]:
     if needle not in app_host_src:
         print(f"canonical app-host.mjs missing telemetry marker: {needle}", file=sys.stderr)

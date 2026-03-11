@@ -519,14 +519,26 @@ private struct NativeCapabilities {
     switch capability {
     case "camera.photo":
       return ((device["camera"] as? [String: Any])?["photo"] as? Bool) == true
+    case "clipboard.read_text":
+      return ((device["clipboard"] as? [String: Any])?["read_text"] as? Bool) == true
+    case "clipboard.write_text":
+      return ((device["clipboard"] as? [String: Any])?["write_text"] as? Bool) == true
     case "files.pick":
       return ((device["files"] as? [String: Any])?["pick"] as? Bool) == true
+    case "files.pick_multiple":
+      return ((device["files"] as? [String: Any])?["pick_multiple"] as? Bool) == true
+    case "files.save":
+      return ((device["files"] as? [String: Any])?["save"] as? Bool) == true
+    case "files.drop":
+      return ((device["files"] as? [String: Any])?["drop"] as? Bool) == true
     case "blob_store":
       return ((device["blob_store"] as? [String: Any])?["enabled"] as? Bool) == true
     case "location.foreground":
       return ((device["location"] as? [String: Any])?["foreground"] as? Bool) == true
     case "notifications.local":
       return ((device["notifications"] as? [String: Any])?["local"] as? Bool) == true
+    case "share.present":
+      return ((device["share"] as? [String: Any])?["present"] as? Bool) == true
     default:
       return false
     }
@@ -557,6 +569,14 @@ private struct BlobManifestDoc: Codable {
       "local_state": local_state,
     ]
   }
+}
+
+private struct ExportPayload {
+  let filename: String
+  let mime: String
+  let bytes: Data
+  let text: String
+  let url: String
 }
 
 private struct PendingNativeRequest {
@@ -658,6 +678,16 @@ private final class NativeBlobStore {
       manifest.local_state = "missing"
     }
     return manifest
+  }
+
+  func read(handle: String) throws -> (BlobManifestDoc, Data) {
+    guard let sha256 = blobSha(handle) else {
+      throw NativeBlobStoreError.io("invalid blob handle")
+    }
+    guard let manifest = try readManifest(sha256) else {
+      throw NativeBlobStoreError.io("missing blob manifest")
+    }
+    return (manifest, try Data(contentsOf: blobURL(sha256)))
   }
 
   func delete(handle: String) throws -> BlobManifestDoc {
@@ -800,6 +830,39 @@ private func mimeType(for url: URL) -> String {
   return "application/octet-stream"
 }
 
+private func fileEntryPayload(manifest: BlobManifestDoc, url: URL, source: String) -> [String: Any] {
+  [
+    "name": url.lastPathComponent,
+    "path": url.absoluteString,
+    "mime": manifest.mime,
+    "byte_size": manifest.byte_size,
+    "last_modified_ms": 0,
+    "source": source,
+    "blob": manifest.payload(),
+  ]
+}
+
+private func jsonValueString(_ value: Any) -> String {
+  switch value {
+  case is NSNull:
+    return "null"
+  case let string as String:
+    let data = try? JSONEncoder().encode(string)
+    return data.map { String(decoding: $0, as: UTF8.self) } ?? "\"\""
+  case let bool as Bool:
+    return bool ? "true" : "false"
+  case let number as NSNumber:
+    return number.stringValue
+  default:
+    if JSONSerialization.isValidJSONObject(value),
+       let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
+    {
+      return String(decoding: data, as: UTF8.self)
+    }
+    return "null"
+  }
+}
+
 struct X07WebView: UIViewRepresentable {
   func makeUIView(context: Context) -> WKWebView {
     let cfg = WKWebViewConfiguration()
@@ -817,6 +880,7 @@ struct X07WebView: UIViewRepresentable {
 
     let webView = WKWebView(frame: .zero, configuration: cfg)
     webView.navigationDelegate = context.coordinator
+    webView.addInteraction(UIDropInteraction(delegate: context.coordinator))
     context.coordinator.attach(webView: webView)
     webView.load(URLRequest(url: URL(string: "x07://localhost/index.html")!))
     return webView
@@ -841,7 +905,7 @@ struct X07WebView: UIViewRepresentable {
   };
   """
 
-  final class Coordinator: NSObject, CLLocationManagerDelegate, UIDocumentPickerDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate, WKScriptMessageHandler, WKNavigationDelegate {
+  final class Coordinator: NSObject, CLLocationManagerDelegate, UIDocumentPickerDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate, UIDropInteractionDelegate, WKScriptMessageHandler, WKNavigationDelegate {
     private let telemetry = TelemetryCoordinator()
     private let capabilities = NativeCapabilities.loadFromBundle()
     private let locationManager = CLLocationManager()
@@ -850,6 +914,10 @@ struct X07WebView: UIViewRepresentable {
     private weak var webView: WKWebView?
     private var pendingCameraRequest: PendingNativeRequest?
     private var pendingFileRequest: PendingNativeRequest?
+    private var pendingFileSaveRequest: PendingNativeRequest?
+    private var pendingExportURL: URL?
+    private var pendingExportMime: String = "text/plain;charset=utf-8"
+    private var pendingExportBytesLen: Int = 0
     private var pendingLocationRequest: PendingNativeRequest?
     private var pendingLocationTimeout: DispatchWorkItem?
     private var pendingPermissionRequest: PendingPermissionRequest?
@@ -930,6 +998,8 @@ struct X07WebView: UIViewRepresentable {
         handlePermissionsRequest(pending, webView: webView)
       case "camera":
         handleCameraRequest(pending, webView: webView)
+      case "clipboard":
+        handleClipboardRequest(pending, webView: webView)
       case "files":
         handleFilesRequest(pending, webView: webView)
       case "blobs":
@@ -938,6 +1008,10 @@ struct X07WebView: UIViewRepresentable {
         handleLocationRequest(pending, webView: webView)
       case "notifications":
         let result = handleNotificationsRequest(request, webView: webView)
+        sendBridgeReply(bridgeRequestId, result: result, webView: webView)
+        emitRequestTelemetry(request: request, status: resultStatus(result), durationMs: Int64(Date().timeIntervalSince(pending.startedAt) * 1000))
+      case "share":
+        let result = handleShareRequest(request, webView: webView)
         sendBridgeReply(bridgeRequestId, result: result, webView: webView)
         emitRequestTelemetry(request: request, status: resultStatus(result), durationMs: Int64(Date().timeIntervalSince(pending.startedAt) * 1000))
       default:
@@ -1057,6 +1131,32 @@ struct X07WebView: UIViewRepresentable {
       }
     }
 
+    private func handleClipboardRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
+      let op = String(describing: pending.request["op"] ?? "")
+      if op == "clipboard.read_text" {
+        completeRequest(
+          pending,
+          webView: webView,
+          status: "ok",
+          payload: ["text": UIPasteboard.general.string ?? ""]
+        )
+        return
+      }
+      let payload = pending.request["payload"] as? [String: Any] ?? [:]
+      let text =
+        (payload["text"] as? String)
+          ?? (payload["value"] as? String)
+          ?? ((payload["body"] as? [String: Any])?["text"] as? String)
+          ?? ""
+      UIPasteboard.general.string = text
+      completeRequest(
+        pending,
+        webView: webView,
+        status: "ok",
+        payload: ["text_bytes_len": Data(text.utf8).count]
+      )
+    }
+
     private func handleCameraRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
       guard capabilities.allows("blob_store"), blobStore != nil else {
         completeRequest(pending, webView: webView, status: "unsupported", payload: ["reason": "blob_store_disabled"])
@@ -1092,6 +1192,22 @@ struct X07WebView: UIViewRepresentable {
     }
 
     private func handleFilesRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
+      let payload = pending.request["payload"] as? [String: Any] ?? [:]
+      switch String(describing: pending.request["op"] ?? "files.pick") {
+      case "files.save":
+        handleFileSaveRequest(pending, webView: webView)
+      case "files.pick_multiple":
+        handleFilePickRequest(pending, webView: webView, multiple: true)
+      default:
+        handleFilePickRequest(
+          pending,
+          webView: webView,
+          multiple: (payload["multiple"] as? Bool) == true || ((payload["multiple"] as? NSNumber)?.boolValue == true)
+        )
+      }
+    }
+
+    private func handleFilePickRequest(_ pending: PendingNativeRequest, webView: WKWebView, multiple: Bool) {
       guard capabilities.allows("blob_store"), blobStore != nil else {
         completeRequest(pending, webView: webView, status: "unsupported", payload: ["reason": "blob_store_disabled"])
         return
@@ -1108,9 +1224,147 @@ struct X07WebView: UIViewRepresentable {
       let accepts = (payload["accept"] as? [String]) ?? capabilities.fileAcceptDefaults()
       pendingFileRequest = pending
       let picker = UIDocumentPickerViewController(forOpeningContentTypes: utTypes(for: accepts), asCopy: true)
-      picker.allowsMultipleSelection = false
+      picker.allowsMultipleSelection = multiple
       picker.delegate = self
       presenter.present(picker, animated: true)
+    }
+
+    private func handleFileSaveRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
+      guard pendingFileSaveRequest == nil else {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": "file save already in flight"])
+        return
+      }
+      let payload = pending.request["payload"] as? [String: Any] ?? [:]
+      let export: ExportPayload
+      do {
+        export = try resolveExportPayload(kind: String(describing: pending.request["kind"] ?? ""), payload: payload)
+      } catch let error as NativeBlobStoreError {
+        completeRequest(pending, webView: webView, status: "error", payload: ["reason": error.code, "message": error.message])
+        return
+      } catch {
+        completeRequest(pending, webView: webView, status: "error", payload: ["reason": "invalid_request", "message": error.localizedDescription])
+        return
+      }
+      let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(export.filename)
+      do {
+        try export.bytes.write(to: tempURL, options: .atomic)
+      } catch {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": error.localizedDescription])
+        return
+      }
+      guard let presenter = hostViewController(for: webView) else {
+        completeRequest(pending, webView: webView, status: "error", payload: ["message": "missing host view controller"])
+        return
+      }
+      pendingFileSaveRequest = pending
+      pendingExportURL = tempURL
+      pendingExportMime = export.mime
+      pendingExportBytesLen = export.bytes.count
+      let picker = UIDocumentPickerViewController(forExporting: [tempURL], asCopy: true)
+      picker.delegate = self
+      presenter.present(picker, animated: true)
+    }
+
+    private func importPickedURLs(_ urls: [URL], source: String) -> (String, [String: Any]) {
+      guard let blobStore else {
+        return ("unsupported", ["reason": "blob_store_disabled"])
+      }
+      var blobs: [[String: Any]] = []
+      var files: [[String: Any]] = []
+      var errors: [[String: Any]] = []
+      for url in urls {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+          if accessed {
+            url.stopAccessingSecurityScopedResource()
+          }
+        }
+        do {
+          let data = try Data(contentsOf: url)
+          let manifest = try blobStore.put(data: data, mime: mimeType(for: url), source: source)
+          blobs.append(manifest.payload())
+          files.append(fileEntryPayload(manifest: manifest, url: url, source: source))
+        } catch let error as NativeBlobStoreError {
+          errors.append([
+            "code": error.code,
+            "message": error.message,
+            "path": url.absoluteString,
+          ])
+        } catch {
+          errors.append([
+            "code": "file_import_failed",
+            "message": error.localizedDescription,
+            "path": url.absoluteString,
+          ])
+        }
+      }
+      var payload: [String: Any] = [
+        "blobs": blobs,
+        "files": files,
+        "accepted_count": files.count,
+        "rejected_count": errors.count,
+      ]
+      if urls.count == 1, let first = urls.first {
+        payload["path"] = first.absoluteString
+      }
+      if !errors.isEmpty {
+        payload["errors"] = errors
+        if !files.isEmpty {
+          payload["partial"] = true
+        }
+      }
+      return files.isEmpty ? ("error", payload) : ("ok", payload)
+    }
+
+    private func resolveExportPayload(kind: String, payload: [String: Any]) throws -> ExportPayload {
+      let defaultFilename = kind == "x07.web_ui.effect.device.files.save_json" ? "export.json" : "export.txt"
+      let defaultMime = kind == "x07.web_ui.effect.device.files.save_json" ? "application/json" : "text/plain;charset=utf-8"
+      let filename =
+        (payload["filename"] as? String)
+          ?? (payload["name"] as? String)
+          ?? (payload["suggested_name"] as? String)
+          ?? defaultFilename
+      let requestMime =
+        ((payload["mime"] as? String) ?? (payload["content_type"] as? String) ?? defaultMime)
+          .isEmpty ? defaultMime : ((payload["mime"] as? String) ?? (payload["content_type"] as? String) ?? defaultMime)
+      let blobHandle =
+        ((payload["blob_handle"] as? String) ?? (payload["handle"] as? String) ?? "")
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+      if !blobHandle.isEmpty {
+        guard let blobStore else {
+          throw NativeBlobStoreError.io("blob store unavailable")
+        }
+        let (manifest, data) = try blobStore.read(handle: blobHandle)
+        return ExportPayload(filename: filename, mime: manifest.mime.isEmpty ? requestMime : manifest.mime, bytes: data, text: "", url: "")
+      }
+      if kind == "x07.web_ui.effect.device.files.save_json" {
+        let jsonValue = payload["value"] ?? payload["json"] ?? NSNull()
+        let text = "\(jsonValueString(jsonValue))\n"
+        return ExportPayload(
+          filename: filename,
+          mime: requestMime,
+          bytes: Data(text.utf8),
+          text: text,
+          url: ""
+        )
+      }
+      let text =
+        (payload["text"] as? String)
+          ?? (payload["value"] as? String)
+          ?? ((payload["body"] as? [String: Any])?["text"] as? String)
+          ?? ""
+      let url = (payload["url"] as? String) ?? (payload["href"] as? String) ?? ""
+      let body = text.isEmpty ? url : text
+      guard !body.isEmpty else {
+        throw NSError(domain: "x07.device.host", code: 1, userInfo: [NSLocalizedDescriptionKey: "request payload missing text/url/blob_handle"])
+      }
+      return ExportPayload(
+        filename: filename,
+        mime: requestMime,
+        bytes: Data(body.utf8),
+        text: text,
+        url: url
+      )
     }
 
     private func handleBlobsRequest(_ pending: PendingNativeRequest, webView: WKWebView) {
@@ -1219,6 +1473,158 @@ struct X07WebView: UIViewRepresentable {
       )
     }
 
+    private func handleShareRequest(_ request: [String: Any], webView: WKWebView) -> [String: Any] {
+      guard let presenter = hostViewController(for: webView) else {
+        return nativeBridgeResult(
+          family: "share",
+          request: request,
+          status: "error",
+          payload: ["message": "missing host view controller"]
+        )
+      }
+      let payload = request["payload"] as? [String: Any] ?? [:]
+      let kind = String(describing: request["kind"] ?? "")
+      if kind == "x07.web_ui.effect.device.share.share_files" {
+        guard let blobStore else {
+          return nativeBridgeResult(
+            family: "share",
+            request: request,
+            status: "unsupported",
+            payload: ["reason": "blob_store_unavailable"]
+          )
+        }
+        let rawItems = (payload["items"] as? [[String: Any]]) ?? (payload["blobs"] as? [[String: Any]]) ?? []
+        guard !rawItems.isEmpty else {
+          return nativeBridgeResult(
+            family: "share",
+            request: request,
+            status: "error",
+            payload: ["reason": "invalid_request", "message": "share_files requires at least one item"]
+          )
+        }
+        var activityItems: [Any] = []
+        var normalizedItems: [[String: Any]] = []
+        for (index, rawItem) in rawItems.enumerated() {
+          let blobDoc = (rawItem["blob"] as? [String: Any]) ?? rawItem
+          let handle =
+            ((blobDoc["handle"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+          guard !handle.isEmpty else {
+            return nativeBridgeResult(
+              family: "share",
+              request: request,
+              status: "error",
+              payload: ["reason": "invalid_request", "message": "share file item missing blob.handle"]
+            )
+          }
+          let manifest: BlobManifestDoc
+          let data: Data
+          do {
+            (manifest, data) = try blobStore.read(handle: handle)
+          } catch let error as NativeBlobStoreError {
+            return nativeBridgeResult(
+              family: "share",
+              request: request,
+              status: "error",
+              payload: ["reason": error.code, "message": error.message]
+            )
+          } catch {
+            return nativeBridgeResult(
+              family: "share",
+              request: request,
+              status: "error",
+              payload: ["message": error.localizedDescription]
+            )
+          }
+          let name = ((rawItem["name"] as? String) ?? "").isEmpty ? "file-\(index + 1)" : String(describing: rawItem["name"] ?? "")
+          let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+          do {
+            try data.write(to: tempURL, options: .atomic)
+            activityItems.append(tempURL)
+            normalizedItems.append([
+              "name": name,
+              "mime": manifest.mime,
+              "byte_size": manifest.byte_size,
+              "blob": manifest.payload(),
+            ])
+          } catch {
+            return nativeBridgeResult(
+              family: "share",
+              request: request,
+              status: "error",
+              payload: ["message": error.localizedDescription]
+            )
+          }
+        }
+        let activity = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+        if let title = (payload["title"] as? String) ?? (payload["subject"] as? String), !title.isEmpty {
+          activity.setValue(title, forKey: "subject")
+        }
+        presenter.present(activity, animated: true)
+        return nativeBridgeResult(
+          family: "share",
+          request: request,
+          status: "ok",
+          payload: ["items": normalizedItems]
+        )
+      }
+      let export: ExportPayload
+      do {
+        export = try resolveExportPayload(kind: kind, payload: payload)
+      } catch let error as NativeBlobStoreError {
+        return nativeBridgeResult(
+          family: "share",
+          request: request,
+          status: "error",
+          payload: ["reason": error.code, "message": error.message]
+        )
+      } catch {
+        return nativeBridgeResult(
+          family: "share",
+          request: request,
+          status: "error",
+          payload: ["reason": "invalid_request", "message": error.localizedDescription]
+        )
+      }
+
+      var items: [Any] = []
+      if !export.text.isEmpty {
+        items.append(export.text)
+      }
+      if !export.url.isEmpty, let url = URL(string: export.url) {
+        items.append(url)
+      }
+      if items.isEmpty {
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(export.filename)
+        do {
+          try export.bytes.write(to: tempURL, options: .atomic)
+          items.append(tempURL)
+        } catch {
+          return nativeBridgeResult(
+            family: "share",
+            request: request,
+            status: "error",
+            payload: ["message": error.localizedDescription]
+          )
+        }
+      }
+
+      let activity = UIActivityViewController(activityItems: items, applicationActivities: nil)
+      if let title = (payload["title"] as? String) ?? (payload["subject"] as? String), !title.isEmpty {
+        activity.setValue(title, forKey: "subject")
+      }
+      presenter.present(activity, animated: true)
+      return nativeBridgeResult(
+        family: "share",
+        request: request,
+        status: "ok",
+        payload: [
+          "shared": true,
+          "bytes_len": export.bytes.count,
+          "mime": export.mime,
+        ]
+      )
+    }
+
     private func nativeBridgeResult(
       family: String,
       request: [String: Any],
@@ -1301,12 +1707,116 @@ struct X07WebView: UIViewRepresentable {
       )
     }
 
+    private func emitDropEvent(urls: [URL], preloadErrors: [[String: Any]] = []) {
+      guard let webView else {
+        return
+      }
+      let startedAt = Date()
+      DispatchQueue.global(qos: .userInitiated).async { [weak self, weak webView] in
+        guard let self, let webView else { return }
+        var (status, payload) = self.importPickedURLs(urls, source: "files.drop")
+        var errors = preloadErrors
+        if let payloadErrors = payload["errors"] as? [[String: Any]] {
+          errors.append(contentsOf: payloadErrors)
+        }
+        if !errors.isEmpty {
+          payload["errors"] = errors
+          if (payload["accepted_count"] as? Int ?? 0) > 0 {
+            payload["partial"] = true
+          } else {
+            status = "error"
+          }
+        }
+        self.telemetry.emitNativeEvent(
+          eventClass: status == "error" ? "runtime.error" : "bridge.timing",
+          name: "device.files.drop",
+          severity: status == "error" ? "error" : "info",
+          attributes: [
+            "x07.device.op": "files.drop",
+            "x07.device.request_id": "",
+            "x07.device.status": status,
+            "x07.device.capability": "files.drop",
+            "x07.device.platform": "ios",
+            "x07.device.duration_ms": Int64(Date().timeIntervalSince(startedAt) * 1000),
+            "x07.device.accepted_count": payload["accepted_count"] as? Int ?? 0,
+            "x07.device.rejected_count": payload["rejected_count"] as? Int ?? 0,
+          ]
+        )
+        DispatchQueue.main.async {
+          self.evaluateBridgeHook(
+            "__x07DispatchDeviceEvent",
+            payload: [
+              "type": "files.drop",
+              "status": status,
+              "source": "ios",
+              "files": payload["files"] ?? [],
+              "blobs": payload["blobs"] ?? [],
+              "accepted_count": payload["accepted_count"] ?? 0,
+              "rejected_count": payload["rejected_count"] ?? 0,
+              "errors": payload["errors"] ?? [],
+              "partial": payload["partial"] ?? false,
+            ],
+            webView: webView
+          )
+        }
+      }
+    }
+
     private func evaluateBridgeHook(_ hookName: String, payload: [String: Any], webView: WKWebView) {
       guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
         return
       }
       let json = String(decoding: data, as: UTF8.self)
       webView.evaluateJavaScript("globalThis.\(hookName)?.(\(json));")
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+      _ = interaction
+      guard capabilities.allows("files.drop"), capabilities.allows("blob_store") else {
+        return false
+      }
+      return session.items.contains { item in
+        item.itemProvider.canLoadObject(ofClass: NSURL.self)
+      }
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+      _ = interaction
+      _ = session
+      UIDropProposal(operation: .copy)
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+      _ = interaction
+      let providers = session.items.map(\.itemProvider).filter { $0.canLoadObject(ofClass: NSURL.self) }
+      guard !providers.isEmpty else {
+        return
+      }
+      let group = DispatchGroup()
+      let lock = NSLock()
+      var urls: [URL] = []
+      var errors: [[String: Any]] = []
+      for provider in providers {
+        group.enter()
+        provider.loadObject(ofClass: NSURL.self) { object, error in
+          lock.lock()
+          defer {
+            lock.unlock()
+            group.leave()
+          }
+          if let url = object as? URL {
+            urls.append(url)
+          } else if let error {
+            errors.append([
+              "code": "file_drop_failed",
+              "message": error.localizedDescription,
+            ])
+          }
+        }
+      }
+      group.notify(queue: .main) { [weak self] in
+        self?.emitDropEvent(urls: urls, preloadErrors: errors)
+      }
     }
 
     private static func cameraState() -> String {
@@ -1424,6 +1934,17 @@ struct X07WebView: UIViewRepresentable {
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
       controller.dismiss(animated: true)
+      if let pending = pendingFileSaveRequest, let webView {
+        pendingFileSaveRequest = nil
+        if let pendingExportURL {
+          try? FileManager.default.removeItem(at: pendingExportURL)
+        }
+        pendingExportURL = nil
+        pendingExportMime = "text/plain;charset=utf-8"
+        pendingExportBytesLen = 0
+        completeRequest(pending, webView: webView, status: "cancelled", payload: [:])
+        return
+      }
       guard let pending = pendingFileRequest, let webView else {
         return
       }
@@ -1433,33 +1954,43 @@ struct X07WebView: UIViewRepresentable {
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
       controller.dismiss(animated: true)
+      if let pending = pendingFileSaveRequest, let webView {
+        pendingFileSaveRequest = nil
+        let pendingURL = pendingExportURL
+        defer {
+          if let pendingURL {
+            try? FileManager.default.removeItem(at: pendingURL)
+          }
+          pendingExportURL = nil
+          pendingExportMime = "text/plain;charset=utf-8"
+          pendingExportBytesLen = 0
+        }
+        let exportedURL = urls.first ?? pendingURL
+        completeRequest(
+          pending,
+          webView: webView,
+          status: exportedURL == nil ? "cancelled" : "ok",
+          payload: exportedURL == nil
+            ? [:]
+            : [
+                "filename": pendingURL?.lastPathComponent ?? "export.txt",
+                "mime": pendingExportMime,
+                "bytes_len": pendingExportBytesLen,
+                "path": exportedURL?.absoluteString ?? "",
+              ]
+        )
+        return
+      }
       guard let pending = pendingFileRequest, let webView else {
         return
       }
       pendingFileRequest = nil
-      guard let url = urls.first else {
+      guard !urls.isEmpty else {
         completeRequest(pending, webView: webView, status: "cancelled", payload: [:])
         return
       }
-      let accessed = url.startAccessingSecurityScopedResource()
-      defer {
-        if accessed {
-          url.stopAccessingSecurityScopedResource()
-        }
-      }
-      do {
-        guard let blobStore else {
-          completeRequest(pending, webView: webView, status: "unsupported", payload: ["reason": "blob_store_disabled"])
-          return
-        }
-        let data = try Data(contentsOf: url)
-        let manifest = try blobStore.put(data: data, mime: mimeType(for: url), source: "files")
-        completeRequest(pending, webView: webView, status: "ok", payload: ["blobs": [manifest.payload()]])
-      } catch let error as NativeBlobStoreError {
-        completeRequest(pending, webView: webView, status: "error", payload: ["reason": error.code, "message": error.message])
-      } catch {
-        completeRequest(pending, webView: webView, status: "error", payload: ["message": error.localizedDescription])
-      }
+      let (status, payload) = importPickedURLs(urls, source: "files.pick")
+      completeRequest(pending, webView: webView, status: status, payload: payload)
     }
 
     func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
