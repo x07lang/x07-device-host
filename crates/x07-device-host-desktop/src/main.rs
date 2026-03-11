@@ -372,7 +372,7 @@ impl DesktopNativeRuntime {
                 "result": desktop_result_doc(
                     request,
                     "ok",
-                    json!({ "text_bytes_len": text.as_bytes().len() }),
+                    json!({ "text_bytes_len": text.len() }),
                     desktop_host_meta(),
                 ),
             }),
@@ -499,10 +499,7 @@ impl DesktopNativeRuntime {
     }
 
     fn handle_files_save_request(&self, request: &Value) -> Value {
-        let request_kind = request
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let request_kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
         let default_filename = if request_kind == "x07.web_ui.effect.device.files.save_json" {
             "export.json"
         } else {
@@ -560,7 +557,8 @@ impl DesktopNativeRuntime {
                 .cloned()
                 .or_else(|| request.pointer("/payload/json").cloned())
                 .unwrap_or(Value::Null);
-            let mut text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string());
+            let mut text =
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string());
             text.push('\n');
             (mime.to_string(), text.into_bytes())
         } else if let Some(text) = request
@@ -1887,26 +1885,30 @@ fn desktop_capability_allowed(capabilities: &Value, capability: &str) -> bool {
             .and_then(|value| value.get("write_text"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        "files.pick" => device
-            .and_then(|value| value.get("files"))
-            .and_then(|value| value.get("pick"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || device
-                .and_then(|value| value.get("files"))
-                .and_then(|value| value.get("pick_multiple"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        "files.pick_multiple" => device
-            .and_then(|value| value.get("files"))
-            .and_then(|value| value.get("pick_multiple"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || device
+        "files.pick" => {
+            device
                 .and_then(|value| value.get("files"))
                 .and_then(|value| value.get("pick"))
                 .and_then(Value::as_bool)
-                .unwrap_or(false),
+                .unwrap_or(false)
+                || device
+                    .and_then(|value| value.get("files"))
+                    .and_then(|value| value.get("pick_multiple"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
+        "files.pick_multiple" => {
+            device
+                .and_then(|value| value.get("files"))
+                .and_then(|value| value.get("pick_multiple"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || device
+                    .and_then(|value| value.get("files"))
+                    .and_then(|value| value.get("pick"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
         "files.save" => device
             .and_then(|value| value.get("files"))
             .and_then(|value| value.get("save"))
