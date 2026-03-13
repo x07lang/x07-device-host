@@ -5,11 +5,11 @@
     "assets": [
       {
         "path": "index.html",
-        "sha256": "32dd8528fcd0a92d51031119e7f4b13de9b0b6120eb6dc79aa294d3a39fb7e5a"
+        "sha256": "95781e9bcca7332548b8a80cb3349afcae5cf62361ad493fc60ed3fd0f8f10c3"
       },
       {
         "path": "bootstrap.js",
-        "sha256": "105fc98dc3d03b27885e3f484d6f6fa761d9006ba8e91b90bcb0089d6062d4aa"
+        "sha256": "e5ddb36e10154a4db8e40e083c1daaa8c08594cce2fcb3ab7c95617e03d47de9"
       },
       {
         "path": "main.mjs",
@@ -17,12 +17,12 @@
       },
       {
         "path": "app-host.mjs",
-        "sha256": "3d983102652ce156f5e5ee1bff97eb18b5463615cf82c4671226959c37bca374"
+        "sha256": "384f2fec752d584f74d0e39d3f67aa95096a6c0d4491fd4b0dda1ba225f9d76a"
       }
     ],
     "bridge_protocol_version": "web_ui_bridge_v1"
   },
-  "host_abi_hash": "32deeb58901cf0ca6340b503e9f1310354182d7bfe75069c4adee3ac0854668b",
+  "host_abi_hash": "896bf62461607d99610bc9df5510ceee025817f047df60cc167125cffdb5b0f0",
   "kind": "device_host_abi_snapshot",
   "schema_version": "x07.device.host_abi.snapshot@0.1.0"
 }

@@ -170,7 +170,7 @@ async function main() {
   if (!root) throw new Error("missing #app");
 
   const manifest = (await loadJsonIfOk("./app.manifest.json")) || null;
-  const bundleManifest = (await loadJsonIfOk("./bundle.manifest.json")) || null;
+  const bundleManifest = hasIpc() ? (await loadJsonIfOk("./bundle.manifest.json")) || null : null;
   const deviceProfile = (await loadBundleSidecar(bundleManifest, "profile")) || null;
   const telemetryProfile = (await loadBundleSidecar(bundleManifest, "telemetry_profile")) || null;
 
@@ -212,7 +212,7 @@ async function main() {
   let componentEsmUrl = null;
   if (manifest?.componentEsmUrl || manifest?.component_esm_url) {
     componentEsmUrl = manifest.componentEsmUrl ?? manifest.component_esm_url ?? null;
-  } else {
+  } else if (hasIpc()) {
     try {
       await import("./transpiled/app.mjs");
       componentEsmUrl = "./transpiled/app.mjs";

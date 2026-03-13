@@ -17,13 +17,13 @@ import pathlib
 import sys
 
 root = pathlib.Path.cwd()
-compat_path = root / "releases" / "compat" / "0.2.4.json"
+compat_path = root / "releases" / "compat" / "0.2.5.json"
 if not compat_path.is_file():
     print(f"missing compat file: {compat_path}", file=sys.stderr)
     sys.exit(1)
 
 compat = json.loads(compat_path.read_text(encoding="utf-8"))
-if compat.get("device_host") != "0.2.4":
+if compat.get("device_host") != "0.2.5":
     print(f"unexpected device_host version in {compat_path}: {compat.get('device_host')!r}", file=sys.stderr)
     sys.exit(1)
 if compat.get("x07_core") != ">=0.1.58,<0.2.0":

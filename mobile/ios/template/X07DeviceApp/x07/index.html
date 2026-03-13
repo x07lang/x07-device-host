@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; connect-src 'self' https: http:; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'; connect-src 'self' https: http:; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>x07-web-ui</title>
@@ -23,6 +23,28 @@
       }
       pre {
         white-space: pre-wrap;
+      }
+      @media (max-width: 720px) {
+        #app {
+          padding: 12px;
+        }
+        .forge_root {
+          display: grid !important;
+          grid-template-columns: minmax(0, 1fr) !important;
+          gap: 12px !important;
+          padding: 12px !important;
+        }
+        .forge_root > .panel {
+          min-width: 0 !important;
+          width: auto !important;
+        }
+        .forge_root > .panel:nth-of-type(1) .control,
+        .forge_root > .panel:nth-of-type(2) .control {
+          width: 100%;
+        }
+        .forge_root > .panel:nth-of-type(3) {
+          display: none !important;
+        }
       }
     </style>
   </head>

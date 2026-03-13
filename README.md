@@ -49,7 +49,7 @@ x07-device-host-desktop --version
 Fallback:
 
 ```bash
-cargo install --locked x07-device-host-desktop --version 0.2.4
+cargo install --locked x07-device-host-desktop --version 0.2.5
 ```
 
 Use the git install path only when you need unreleased development state from this repo:

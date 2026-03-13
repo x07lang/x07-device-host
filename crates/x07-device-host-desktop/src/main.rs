@@ -1401,6 +1401,28 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
         );
     }
 
+    if let Err(err) = register_extra_bundle_files(&bundle_dir, &mut bundle_files, &mut inputs) {
+        diagnostics.push(diag(
+            "X07DEVHOST_BUNDLE_EXTRA_FILES_READ_FAILED",
+            "error",
+            "run",
+            format!("failed to read extra bundle files: {err}"),
+            None,
+        ));
+        return emit_and_exit(
+            raw_argv,
+            started,
+            &bundle_dir,
+            false,
+            false,
+            diagnostics,
+            inputs,
+            outputs,
+            manifest.telemetry_profile.is_some(),
+            args.json,
+        );
+    }
+
     let state = Arc::new(HostState { bundle_files });
     let run_state = Arc::new(Mutex::new(RunState {
         ui_ready: false,
@@ -1856,6 +1878,63 @@ fn serve_path_for(rel_path: &str) -> String {
     format!("/{}", rel_path.trim_start_matches('/'))
 }
 
+fn register_extra_bundle_files(
+    bundle_dir: &Path,
+    bundle_files: &mut BTreeMap<String, ServedFile>,
+    inputs: &mut Vec<FileDigest>,
+) -> Result<()> {
+    register_extra_bundle_files_inner(bundle_dir, bundle_dir, bundle_files, inputs)
+}
+
+fn register_extra_bundle_files_inner(
+    bundle_dir: &Path,
+    dir: &Path,
+    bundle_files: &mut BTreeMap<String, ServedFile>,
+    inputs: &mut Vec<FileDigest>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(dir)
+        .with_context(|| format!("read bundle dir {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("enumerate bundle dir {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat bundle path {}", path.display()))?;
+        if file_type.is_dir() {
+            register_extra_bundle_files_inner(bundle_dir, &path, bundle_files, inputs)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let rel_path = path
+            .strip_prefix(bundle_dir)
+            .with_context(|| format!("strip bundle prefix for {}", path.display()))?;
+        let rel_path = rel_path.to_string_lossy().replace('\\', "/");
+        let serve_path = serve_path_for(&rel_path);
+        if bundle_files.contains_key(&serve_path) {
+            continue;
+        }
+
+        let bytes =
+            fs::read(&path).with_context(|| format!("read extra bundle file {}", path.display()))?;
+        inputs.push(file_digest_bytes(&path, &bytes));
+        bundle_files.insert(
+            serve_path,
+            ServedFile {
+                content_type: desktop_static_mime_type_for_path(&path),
+                bytes,
+            },
+        );
+    }
+
+    Ok(())
+}
+
 fn response_bytes(
     status: StatusCode,
     content_type: &str,
@@ -2151,10 +2230,13 @@ fn desktop_save_file(filename: &str) -> Option<PathBuf> {
 }
 
 fn desktop_mime_type_for_path(path: &Path) -> String {
+    desktop_static_mime_type_for_path(path).to_string()
+}
+
+fn desktop_static_mime_type_for_path(path: &Path) -> &'static str {
     mime_guess::from_path(path)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string()
+        .first_raw()
+        .unwrap_or("application/octet-stream")
 }
 
 fn desktop_device_telemetry_attrs(
@@ -2586,5 +2668,30 @@ mod tests {
             desktop_device_telemetry_name(&json!({}), "error"),
             "device.op.error"
         );
+    }
+
+    #[test]
+    fn register_extra_bundle_files_serves_component_assets() {
+        let bundle_dir = temp_bundle_dir("extra-bundle-files");
+        let transpiled_dir = bundle_dir.join("transpiled");
+        fs::create_dir_all(&transpiled_dir).expect("create transpiled dir");
+        fs::write(transpiled_dir.join("app.mjs"), br#"export * from "./app.js";"#)
+            .expect("write app.mjs");
+        fs::write(transpiled_dir.join("app.js"), b"console.log('ok');").expect("write app.js");
+
+        let mut bundle_files = BTreeMap::new();
+        let mut inputs = Vec::new();
+        register_extra_bundle_files(&bundle_dir, &mut bundle_files, &mut inputs)
+            .expect("register extra bundle files");
+
+        assert!(bundle_files.contains_key("/transpiled/app.mjs"));
+        assert!(bundle_files.contains_key("/transpiled/app.js"));
+        assert!(
+            inputs
+                .iter()
+                .any(|digest| digest.path.ends_with("transpiled/app.mjs"))
+        );
+
+        let _ = fs::remove_dir_all(bundle_dir);
     }
 }
