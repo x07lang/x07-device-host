@@ -1920,8 +1920,8 @@ fn register_extra_bundle_files_inner(
             continue;
         }
 
-        let bytes =
-            fs::read(&path).with_context(|| format!("read extra bundle file {}", path.display()))?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("read extra bundle file {}", path.display()))?;
         inputs.push(file_digest_bytes(&path, &bytes));
         bundle_files.insert(
             serve_path,
@@ -2675,8 +2675,11 @@ mod tests {
         let bundle_dir = temp_bundle_dir("extra-bundle-files");
         let transpiled_dir = bundle_dir.join("transpiled");
         fs::create_dir_all(&transpiled_dir).expect("create transpiled dir");
-        fs::write(transpiled_dir.join("app.mjs"), br#"export * from "./app.js";"#)
-            .expect("write app.mjs");
+        fs::write(
+            transpiled_dir.join("app.mjs"),
+            br#"export * from "./app.js";"#,
+        )
+        .expect("write app.mjs");
         fs::write(transpiled_dir.join("app.js"), b"console.log('ok');").expect("write app.js");
 
         let mut bundle_files = BTreeMap::new();
@@ -2686,11 +2689,9 @@ mod tests {
 
         assert!(bundle_files.contains_key("/transpiled/app.mjs"));
         assert!(bundle_files.contains_key("/transpiled/app.js"));
-        assert!(
-            inputs
-                .iter()
-                .any(|digest| digest.path.ends_with("transpiled/app.mjs"))
-        );
+        assert!(inputs
+            .iter()
+            .any(|digest| digest.path.ends_with("transpiled/app.mjs")));
 
         let _ = fs::remove_dir_all(bundle_dir);
     }
