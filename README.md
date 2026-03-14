@@ -1,12 +1,48 @@
 # x07-device-host
 
-Cross-platform device shell for [X07](https://github.com/x07lang/x07) "device apps" — runs x07 web UI WASM reducers inside the platform's system WebView (WKWebView on macOS/iOS, Android System WebView on Android).
+`x07-device-host` is the device runtime for [X07](https://github.com/x07lang/x07) applications. It runs the same x07 web UI WASM reducer inside the platform's system WebView: WKWebView on Apple platforms, Android System WebView on Android, and a desktop WebView shell on macOS, Linux, and Windows.
 
-x07-device-host is designed for **100% agentic coding** — an AI coding agent builds, packages, and tests device apps entirely on its own using structured contracts, deterministic bundles, and machine-readable outputs. No human needs to write X07 by hand.
+The vision is simple: write one x07 UI reducer, keep the behavior deterministic, and ship that same application across browser, desktop, and mobile without rewriting it for each platform.
+
+x07-device-host is designed for **100% agentic coding**. An AI coding agent can build, package, test, and release device apps using structured contracts, deterministic bundles, and machine-readable outputs instead of handwritten glue code.
+
+## How it fits into the x07 ecosystem
+
+`x07-device-host` is one part of the end-user app story:
+
+- **`x07`** is the core language, toolchain, and docs entrypoint.
+- **`x07-web-ui`** defines the UI reducer contract and the canonical browser-side host behavior.
+- **`x07-wasm-backend`** builds and packages device bundles from x07 projects.
+- **`x07-device-host`** provides the native shell that actually runs those bundles on desktop and mobile.
+- **`x07-platform`** can supervise releases, incidents, and staged rollout for the packaged artifacts.
+
+If you only need a browser app, `x07-web-ui` plus `x07-wasm` is enough. If you want the same app to run as a store-safe desktop or mobile application, this repo is the native runtime layer you add.
+
+## Practical usage
+
+Use `x07-device-host` when you want to:
+
+- ship one x07 UI reducer across browser, desktop, iOS, and Android
+- access native capabilities such as camera, clipboard, file import/export, notifications, location, audio, or haptics through a controlled host bridge
+- package apps for store distribution without remote code loading
+- keep the browser and device execution model aligned so agent-generated tests and release checks stay reliable
 
 ## Prerequisites
 
 The [X07 toolchain](https://github.com/x07lang/x07) must be installed before using x07-device-host. If you (or your agent) are new to X07, start with the **[Agent Quickstart](https://x07lang.org/docs/getting-started/agent-quickstart)** — it covers toolchain setup, project structure, and the workflow conventions an agent needs to be productive.
+
+## Install and first use
+
+Most users install the released component through `x07up`:
+
+```bash
+x07up component add device-host
+x07-device-host-desktop --version
+```
+
+That is the normal end-user path when `x07-device-host` is consumed as part of the broader x07 toolchain.
+
+If you are working directly in this repo, or you need unreleased development state, use the source and crate-based paths in the sections below.
 
 ## What it includes
 
