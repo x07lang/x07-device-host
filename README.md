@@ -1,5 +1,9 @@
 # x07-device-host
 
+## Agent Entrypoint
+
+Start here: https://x07lang.org/docs/getting-started/agent-quickstart
+
 `x07-device-host` is the device runtime for [X07](https://github.com/x07lang/x07) applications. It runs the same x07 web UI WASM reducer inside the platform's system WebView: WKWebView on Apple platforms, Android System WebView on Android, and a desktop WebView shell on macOS, Linux, and Windows.
 
 The vision is simple: write one x07 UI reducer, keep the behavior deterministic, and ship that same application across browser, desktop, and mobile without rewriting it for each platform.
