@@ -1486,7 +1486,9 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
             handle_custom_protocol(protocol_state.clone(), request)
         })
         .with_navigation_handler(|nav_url| navigation_allowed(&nav_url))
-        .with_initialization_script(r#"try { WebAssembly.instantiateStreaming = undefined; } catch (_) {}"#)
+        .with_initialization_script(
+            r#"try { WebAssembly.instantiateStreaming = undefined; } catch (_) {}"#,
+        )
         .with_ipc_handler(move |request| {
             handle_ipc(
                 &ipc_proxy,

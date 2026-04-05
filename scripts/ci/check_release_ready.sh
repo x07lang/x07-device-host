@@ -8,6 +8,8 @@ repo_root() {
 root="$(repo_root)"
 cd "$root"
 
+cargo fmt --check
+
 bash scripts/ci/check_phase9.sh
 bash scripts/ci/check_phase10.sh
 
