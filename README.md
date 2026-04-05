@@ -142,7 +142,7 @@ For the current native surface, the host distinguishes build-time capability all
 - Capture/import operations write bytes into a host-owned blob sandbox and return only manifests to the reducer.
 - `x07-wasm device package` projects map enabled capabilities into generated iOS `Info.plist` usage strings and Android runtime-permission declarations.
 
-Forge M0 builder-I/O bridge families now use these exact capability names when present in `device.capabilities.json`:
+Forge builder-I/O bridge families now use these exact capability names when present in `device.capabilities.json`:
 
 - `audio.playback`
 - `haptics.present`
@@ -155,7 +155,7 @@ Forge M0 builder-I/O bridge families now use these exact capability names when p
 
 `files.pick` remains supported as the single-file path. Multi-file picker results and drag/drop events normalize to the same manifest-oriented shape (`files`, `blobs`, `accepted_count`, `rejected_count`, optional `errors`/`partial`), and unsupported targets still return deterministic `unsupported` results instead of ad hoc platform failures.
 
-The current Tactics M0 device UX line adds:
+The current Tactics device UX line adds:
 
 - shared-host cue audio via `audio.playback`, with native hosts allowed to return deterministic `unsupported` so the embedded WebView runtime can synthesize the cue locally
 - native haptics via `haptics.present` on iOS and Android, with deterministic `unsupported` replies on desktop
@@ -177,7 +177,7 @@ Template networking defaults now cover collector development endpoints too:
 - Android declares `android.permission.INTERNET` and `android:usesCleartextTraffic="true"` for HTTP OTLP collectors.
 - iOS includes `NSAllowsArbitraryLoads` so the native `URLSession` telemetry sink can reach HTTP OTLP endpoints.
 
-`scripts/ci/check_phase10.sh` validates the template asset sync plus the native telemetry hooks, crash hooks, Android cleartext support, and iOS ATS settings.
+`scripts/ci/check_release_ready.sh` validates the template asset sync plus the native telemetry hooks, crash hooks, Android cleartext support, and iOS ATS settings.
 
 ## Avoiding CI Reruns
 
@@ -189,8 +189,8 @@ cargo clippy -p x07-device-host-desktop --all-targets -- -D warnings
 
 Two recurring CI failure modes in this repo are worth checking locally first:
 
-- Desktop bundle-loading helpers should not return a large `Diagnostic` directly in a `Result` error path; `clippy::result_large_err` is enforced in the macOS `phase9` job.
-- Ubuntu jobs that run `scripts/ci/check_phase9.sh` or `scripts/ci/check_release_ready.sh` need `xz-utils` and `libwebkit2gtk-4.1-dev`, because those gates compile the desktop host and require the system WebKit/GLib pkg-config files.
+- Desktop bundle-loading helpers should not return a large `Diagnostic` directly in a `Result` error path; `clippy::result_large_err` is enforced in the macOS desktop CI job.
+- Ubuntu jobs that compile the desktop host (including `scripts/ci/check_release_ready.sh`) need `xz-utils` and `libwebkit2gtk-4.1-dev`, because those gates require the system WebKit/GLib pkg-config files.
 
 ## Links
 

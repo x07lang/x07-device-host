@@ -1486,7 +1486,7 @@ fn cmd_run(raw_argv: &[OsString], started: Instant, args: RunArgs) -> Result<u8>
             handle_custom_protocol(protocol_state.clone(), request)
         })
         .with_navigation_handler(|nav_url| navigation_allowed(&nav_url))
-        .with_initialization_script(r#"globalThis.__x07DeviceNativeBridge = "m0";"#)
+        .with_initialization_script(r#"try { WebAssembly.instantiateStreaming = undefined; } catch (_) {}"#)
         .with_ipc_handler(move |request| {
             handle_ipc(
                 &ipc_proxy,
@@ -1706,6 +1706,22 @@ fn handle_custom_protocol(
 
     let path = request.uri().path();
     let path = if path == "/" { "/index.html" } else { path };
+    if std::env::var_os("X07_DEVHOST_PROTOCOL_DEBUG").is_some() {
+        let origin = request
+            .headers()
+            .get("Origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        let mode = request
+            .headers()
+            .get("Sec-Fetch-Mode")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        eprintln!(
+            "x07-device-host-desktop protocol {} {path} origin={origin} mode={mode}",
+            request.method()
+        );
+    }
 
     match path {
         "/index.html" => {
@@ -1940,8 +1956,11 @@ fn response_bytes(
     content_type: &str,
     body: Cow<'static, [u8]>,
 ) -> Response<Cow<'static, [u8]>> {
+    let body_len = body.len();
     let mut b = Response::builder().status(status);
     b = b.header("Content-Type", content_type);
+    b = b.header("Content-Length", body_len.to_string());
+    b = b.header("Access-Control-Allow-Origin", "*");
     b.body(body).expect("build response")
 }
 
